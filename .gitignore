@@ -1,0 +1,26 @@
+# Environment
+.env
+__pycache__/
+*.pyc
+*.pyo
+
+# Models & State (stored on Google Drive, not Git)
+models/*.json
+models/*.pkl
+models/*.joblib
+local_state/
+
+# Data caches
+data/*.csv
+data/*.parquet
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
