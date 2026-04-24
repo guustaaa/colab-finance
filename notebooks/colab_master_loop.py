@@ -62,7 +62,7 @@ for subdir in ["models", "logs", "data"]:
 print(f"✅ State directory ready: {STATE_DIR}")
 
 # Clone or pull the repository
-REPO_URL = "https://github.com/YOUR_USERNAME/colab-finance.git"  # ← UPDATE THIS
+REPO_URL = "https://github.com/guustaaa/colab-finance.git"
 REPO_DIR = "/content/colab-finance"
 
 if os.path.exists(REPO_DIR):
