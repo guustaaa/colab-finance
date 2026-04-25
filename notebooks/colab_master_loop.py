@@ -98,6 +98,11 @@ def sync_repo():
 
 sync_repo()
 
+# Flush any stale src.* modules cached from a previous cell run
+for _k in [k for k in sys.modules if k.startswith("src")]:
+    del sys.modules[_k]
+import importlib; importlib.invalidate_caches()
+
 os.chdir(REPO_DIR)
 os.system("pip install -r requirements.txt -q")
 sys.path.insert(0, REPO_DIR)
@@ -148,7 +153,8 @@ import logging
 from src.config import (
     INSTRUMENTS, TRADING_GRANULARITY, TRAINING_HISTORY_COUNT,
     MAX_RUNTIME_HOURS, POLL_INTERVAL_SECONDS, WEBHOOK_URL,
-    HMM_RETRAIN_INTERVAL,
+    HMM_RETRAIN_INTERVAL, BULK_HISTORY_YEARS,
+    DRIVE_DATA_DIR, DRIVE_MODELS_DIR, COMPUTE_DEVICE,
 )
 from src.data_fetcher import CapitalFetcher
 from src.features import compute_all_features
@@ -218,13 +224,6 @@ import multiprocessing
 import concurrent.futures
 from datetime import timezone
 
-from src.config import (
-    INSTRUMENTS, TRADING_GRANULARITY, TRAINING_HISTORY_COUNT,
-    MAX_RUNTIME_HOURS, POLL_INTERVAL_SECONDS, WEBHOOK_URL,
-    HMM_RETRAIN_INTERVAL, BULK_HISTORY_YEARS,
-    DRIVE_DATA_DIR, DRIVE_MODELS_DIR,
-    COMPUTE_DEVICE,
-)
 
 N_CORES = multiprocessing.cpu_count()
 
