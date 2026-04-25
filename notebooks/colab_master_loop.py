@@ -244,33 +244,26 @@ else:
     print("   ℹ️  CPU mode — all cores active via n_jobs=-1.")
 
 # ── STEP 1: Bulk data fetch for every pair in parallel ──
-print("\n📥 Fetching 2 years of history per pair (cached to Drive)...")
+print("\n📥 Fetching 2 years of history per pair (sequential, cached to Drive)...")
 _t0 = time.time()
 
-def _fetch_pair(inst):
-    cache_path = os.path.join(DRIVE_DATA_DIR, f"{inst}_H1_2y.parquet")
-    df = fetcher.fetch_bulk_history(
-        instrument=inst,
+raw_data = {}
+for _inst in INSTRUMENTS:
+    _cache = os.path.join(DRIVE_DATA_DIR, f"{_inst}_H1_2y.parquet")
+    _df = fetcher.fetch_bulk_history(
+        instrument=_inst,
         years=BULK_HISTORY_YEARS,
         granularity=TRADING_GRANULARITY,
-        cache_path=cache_path,
+        cache_path=_cache,
     )
-    return inst, df
-
-raw_data = {}
-# Use threads (not processes) — CapitalClient session is not fork-safe
-with concurrent.futures.ThreadPoolExecutor(max_workers=min(N_CORES, len(INSTRUMENTS))) as ex:
-    futures = {ex.submit(_fetch_pair, inst): inst for inst in INSTRUMENTS}
-    for fut in concurrent.futures.as_completed(futures):
-        inst, df = fut.result()
-        if df is not None and len(df) >= 2000:
-            raw_data[inst] = df
-            print(f"  ✅ {inst}: {len(df):,} candles ({df.index[0].date()} → {df.index[-1].date()})")
-        else:
-            n = len(df) if df is not None else 0
-            print(f"  ⚠️  {inst}: only {n} candles — using what we have")
-            if df is not None and len(df) >= 300:
-                raw_data[inst] = df
+    if _df is not None and len(_df) >= 300:
+        raw_data[_inst] = _df
+        _tag = f"{_df.index[0].date()} → {_df.index[-1].date()}" if len(_df) >= 2000 else f"only {len(_df)} candles"
+        _icon = "✅" if len(_df) >= 2000 else "⚠️ "
+        print(f"  {_icon} {_inst}: {len(_df):,} candles ({_tag})")
+    else:
+        print(f"  ❌ {_inst}: no usable data")
+    time.sleep(0.5)  # courtesy pause between pairs
 
 print(f"\n📥 Data fetch done in {time.time() - _t0:.0f}s")
 notifier.send(f"📥 Bulk data loaded: {len(raw_data)}/{len(INSTRUMENTS)} pairs ready", "info")
@@ -405,10 +398,13 @@ def live_trading_loop():
       4. Every 24 cycles: refresh HMM on recent data
       5. Every 60 cycles: performance report + save to Drive
     """
-    start_time  = datetime.now()
-    end_time    = start_time + timedelta(hours=MAX_RUNTIME_HOURS)
+    start_time   = datetime.now()
+    end_time     = start_time + timedelta(hours=MAX_RUNTIME_HOURS)
     candle_count = 0
     trade_count  = 0
+    _last_save          = time.time()
+    _last_balance_check = time.time()
+
 
     notifier.send(
         f"🟢 Live trading started. Will run until {end_time.strftime('%H:%M:%S')} "
@@ -421,10 +417,12 @@ def live_trading_loop():
         candle_count += 1
 
         try:
-            # Update balance
-            balance = fetcher.get_account_balance()
-            if balance and balance > 0:
-                risk_mgr.update_balance(balance)
+            # Update balance every 60s (not every cycle — saves API quota)
+            if time.time() - _last_balance_check >= 60:
+                balance = fetcher.get_account_balance()
+                if balance and balance > 0:
+                    risk_mgr.update_balance(balance)
+                _last_balance_check = time.time()
 
             if risk_mgr.is_halted:
                 notifier.send("🚨 Trading HALTED — max drawdown breached!", "error")
@@ -520,30 +518,30 @@ def live_trading_loop():
                     except Exception:
                         pass
 
-            # Performance + Drive save every ~5 hours
-            if candle_count % 60 == 0:
+            # Drive save every 5 minutes wall-clock
+            if time.time() - _last_save >= 300:
                 stats = journal.get_performance_stats()
                 notifier.send(
                     f"📈 {candle_count} cycles | trades={trade_count} | "
                     f"WR={stats.get('win_rate',0):.1%} | "
-                    f"PnL=${stats.get('total_pnl',0):.2f} | "
-                    f"MaxDD=${stats.get('max_drawdown',0):.2f}",
+                    f"PnL=${stats.get('total_pnl',0):.2f}",
                     "info"
                 )
-                # Persist journal to Drive
                 try:
                     state.save()
+                    _last_save = time.time()
                 except Exception:
                     pass
+
 
         except Exception as e:
             logger.error(f"Main loop error: {e}", exc_info=True)
             notifier.send(f"🚨 Loop error: {e}", "error")
 
-        elapsed    = time.time() - cycle_start
-        sleep_time = max(0, POLL_INTERVAL_SECONDS - elapsed)
-        logger.info(f"Cycle {candle_count} done ({elapsed:.1f}s). Sleeping {sleep_time:.0f}s...")
-        time.sleep(sleep_time)
+        elapsed = time.time() - cycle_start
+        logger.info(f"Cycle {candle_count} done ({elapsed:.1f}s).")
+        # No sleep — run continuously. Drive save happens on wall-clock timer.
+
 
     # ── Graceful shutdown ──
     logger.info("="*60 + "\nGRACEFUL SHUTDOWN\n" + "="*60)

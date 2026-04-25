@@ -100,7 +100,7 @@ class RegimeDetector:
                 self._label_states(obs)
 
                 if model_path:
-                    joblib.dump(self.model, model_path)
+                    joblib.dump(self, model_path)   # save full RegimeDetector, not just self.model
                     logger.info(f"HMM model saved to {model_path}")
 
                 logger.info(
