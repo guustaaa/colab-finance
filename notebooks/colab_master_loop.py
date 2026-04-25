@@ -378,9 +378,16 @@ for inst in INSTRUMENTS:
     hmm_path = os.path.join(DRIVE_MODELS_DIR, f"hmm_{inst}.joblib")
     if os.path.exists(hmm_path):
         try:
-            regime_detectors[inst] = _joblib.load(hmm_path)
+            _loaded = _joblib.load(hmm_path)
+            if isinstance(_loaded, RegimeDetector):
+                regime_detectors[inst] = _loaded
+            else:
+                # Stale file (raw GaussianHMM from old code) — discard it
+                logger.warning(f"{inst}: stale HMM file (type={type(_loaded).__name__}), re-creating")
+                os.remove(hmm_path)
+                regime_detectors[inst] = RegimeDetector()
         except Exception:
-            pass  # keep the default empty one
+            regime_detectors[inst] = RegimeDetector()
 
 print("✅ All components ready. Starting live trading loop...\n")
 
