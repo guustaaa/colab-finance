@@ -80,6 +80,27 @@ sys.path.insert(0, REPO_DIR)
 print("✅ Dependencies installed.")
 
 # ─────────────────────────────────────────────
+# Load credentials from Colab Secrets (🔑 icon in left sidebar)
+# ─────────────────────────────────────────────
+from google.colab import userdata
+
+# Required secrets: OANDA_ACCESS_TOKEN, OANDA_ACCOUNT_ID
+# Optional secret:  WEBHOOK_URL (for Discord/Slack notifications)
+for secret_name in ["OANDA_ACCESS_TOKEN", "OANDA_ACCOUNT_ID", "WEBHOOK_URL"]:
+    try:
+        val = userdata.get(secret_name)
+        if val:
+            os.environ[secret_name] = val
+            print(f"✅ Secret loaded: {secret_name}")
+        else:
+            print(f"⚠️  Secret '{secret_name}' is empty.")
+    except userdata.SecretNotFoundError:
+        if secret_name == "WEBHOOK_URL":
+            print(f"ℹ️  Optional secret '{secret_name}' not set (notifications disabled).")
+        else:
+            print(f"❌ REQUIRED secret '{secret_name}' not found! Add it via 🔑 Secrets in the left sidebar.")
+
+# ─────────────────────────────────────────────
 # CELL 2: Initialize Components
 # ─────────────────────────────────────────────
 import numpy as np
