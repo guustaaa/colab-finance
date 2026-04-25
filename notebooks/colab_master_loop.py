@@ -290,18 +290,22 @@ print("   Models are saved to Drive every 5 minutes.\n")
 _train_start = time.time()
 _checkpoint_interval = 300  # 5 minutes
 
-def _train_one_instrument(inst, df, sentiment_score):
+def _train_one_instrument(inst, df, sentiment_score, all_raw_data):
     """
     Full training pipeline for one instrument.
-    Returns (inst, metrics) or (inst, None) on failure.
+    Returns (inst, ens, metrics) or (inst, None, error_msg) on failure.
     """
     from src.features import compute_all_features
     from src.regime import RegimeDetector
     from src.ensemble import EnsembleEngine
 
     try:
-        # Feature engineering
-        features = compute_all_features(df, sentiment=sentiment_score)
+        # Build cross-pair data (all pairs except this one)
+        cross_pair_data = {k: v for k, v in all_raw_data.items() if k != inst}
+        other_pairs = [k for k in all_raw_data if k != inst]
+
+        # Feature engineering with cross-pair correlations
+        features = compute_all_features(df, sentiment=sentiment_score, cross_pair_data=cross_pair_data)
         if features.empty:
             return inst, None, f"feature engineering failed on {len(df)} candles"
 
@@ -310,12 +314,12 @@ def _train_one_instrument(inst, df, sentiment_score):
         rd = RegimeDetector()
         rd.fit(df, model_path=hmm_path)
 
-        # Train ensemble (walk-forward XGB + LGB)
+        # Train ensemble (XGB + LGB + DNN stacker) with cross-pair awareness
         ens_path = os.path.join(DRIVE_MODELS_DIR, f"ensemble_{inst}.joblib")
-        ens = EnsembleEngine(model_path=ens_path)
+        ens = EnsembleEngine(model_path=ens_path, cross_pairs=other_pairs)
         metrics = ens.train(features)
 
-        # Persist to Drive immediately
+        # Persist to Drive
         import joblib
         joblib.dump(rd,  hmm_path)
         joblib.dump(ens, ens_path)
@@ -336,7 +340,7 @@ _train_errors  = {}
 
 with concurrent.futures.ThreadPoolExecutor(max_workers=len(INSTRUMENTS)) as ex:
     _futures = {
-        ex.submit(_train_one_instrument, inst, raw_data[inst], _sentiment): inst
+        ex.submit(_train_one_instrument, inst, raw_data[inst], _sentiment, raw_data): inst
         for inst in raw_data
     }
 
@@ -453,18 +457,26 @@ def live_trading_loop():
             # Sentiment is cheap — get it once per cycle
             sentiment = scanner.get_composite_score()
 
+            # Fetch all pairs' candles once per cycle (for cross-pair features)
+            _cycle_data = {}
+            for _ci in INSTRUMENTS:
+                _cdf = fetcher.fetch_candles(_ci, count=300, granularity=TRADING_GRANULARITY)
+                if _cdf is not None and len(_cdf) >= 200:
+                    _cycle_data[_ci] = _cdf
+
             for inst in INSTRUMENTS:
                 try:
                     if executor.has_open_position(inst):
                         logger.info(f"{inst}: position open — skipping")
                         continue
 
-                    # Fetch recent 300 candles for live features
-                    df = fetcher.fetch_candles(inst, count=300, granularity=TRADING_GRANULARITY)
-                    if df is None or len(df) < 250:
+                    df = _cycle_data.get(inst)
+                    if df is None:
                         continue
 
-                    features = compute_all_features(df, sentiment=sentiment)
+                    # Cross-pair data for correlation features
+                    cross_data = {k: v for k, v in _cycle_data.items() if k != inst}
+                    features = compute_all_features(df, sentiment=sentiment, cross_pair_data=cross_data)
                     if features.empty:
                         continue
 
