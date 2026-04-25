@@ -296,13 +296,14 @@ class CapitalFetcher:
         if cache_path and os.path.exists(cache_path):
             try:
                 cached = pd.read_parquet(cache_path)
-                # Only use cache if it's recent enough (within 1 day)
-                if not cached.empty:
+                if not cached.empty and len(cached) >= 300:
                     age_hours = (pd.Timestamp.now(tz="UTC") - cached.index[-1]).total_seconds() / 3600
                     if age_hours < 24:
                         logger.info(f"[{instrument}] Loaded {len(cached)} candles from cache (age {age_hours:.1f}h)")
                         return cached
                     logger.info(f"[{instrument}] Cache stale ({age_hours:.0f}h old). Refreshing...")
+                elif not cached.empty:
+                    logger.warning(f"[{instrument}] Cache too small ({len(cached)} candles). Re-fetching.")
             except Exception as e:
                 logger.warning(f"[{instrument}] Cache read failed: {e}. Re-fetching.")
 

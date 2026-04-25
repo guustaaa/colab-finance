@@ -164,8 +164,12 @@ from src.ensemble import EnsembleEngine
 from src.execution import RiskManager, CapitalExecutor
 from src.utils import Notifier, StateManager, TradeJournal, setup_logger
 
-# Setup logging
+# Setup logging — force-clear stale handlers from previous cell runs
 log_dir = os.path.join(STATE_DIR, "logs")
+for _name in ["colab_master", "data_fetcher", "regime", "ensemble", "notifier", "execution"]:
+    _lg = logging.getLogger(_name)
+    _lg.handlers.clear()
+    _lg.propagate = False
 logger = setup_logger("colab_master", log_dir)
 
 # Initialize all components
@@ -243,7 +247,18 @@ elif COMPUTE_DEVICE == "gpu":
 else:
     print("   ℹ️  CPU mode — all cores active via n_jobs=-1.")
 
-# ── STEP 1: Bulk data fetch for every pair in parallel ──
+# ── STEP 1: Bulk data fetch ──
+# Nuke any poisoned caches (< 500 candles) from previous failed runs
+import glob as _glob
+for _pq in _glob.glob(os.path.join(DRIVE_DATA_DIR, "*_H1_2y.parquet")):
+    try:
+        _tmp = pd.read_parquet(_pq)
+        if len(_tmp) < 500:
+            os.remove(_pq)
+            print(f"  🗑️  Deleted poisoned cache: {os.path.basename(_pq)} ({len(_tmp)} candles)")
+    except Exception:
+        os.remove(_pq)
+
 print("\n📥 Fetching 2 years of history per pair (sequential, cached to Drive)...")
 _t0 = time.time()
 
