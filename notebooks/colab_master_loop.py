@@ -206,88 +206,200 @@ notifier.send("🚀 Forex AI System initializing...", "info")
 print("✅ All components initialized.")
 
 # ─────────────────────────────────────────────
-# CELL 3: Daily Retraining
+# CELL 3: HEAVY TRAINING — Bulk Data Fetch + Full Model Training
 # ─────────────────────────────────────────────
-def daily_retrain():
-    """
-    Train the HMM regime detector and XGBoost ensemble for each instrument.
-    Uses the latest available historical data from Capital.com.
-    """
-    notifier.send("📊 Starting daily retraining routine...", "info")
-    results = {}
+#
+# This cell runs ONCE at startup and eats up all available Colab compute.
+# Strategy:
+#   1. Bulk-fetch 2 years of H1 data per pair (paginated, cached to Drive)
+#   2. Train HMM + XGBoost/LightGBM ensemble on each pair in parallel
+#   3. Checkpoint models to Drive every 5 minutes
+#   4. When done → hand off to lean live trading loop
+#
+import multiprocessing
+import concurrent.futures
+from datetime import timezone
 
-    for inst in INSTRUMENTS:
-        logger.info(f"\n{'='*40}\nRetraining {inst}\n{'='*40}")
+from src.config import (
+    INSTRUMENTS, TRADING_GRANULARITY, TRAINING_HISTORY_COUNT,
+    MAX_RUNTIME_HOURS, POLL_INTERVAL_SECONDS, WEBHOOK_URL,
+    HMM_RETRAIN_INTERVAL, BULK_HISTORY_YEARS,
+    DRIVE_DATA_DIR, DRIVE_MODELS_DIR,
+)
+
+N_CORES = multiprocessing.cpu_count()
+print(f"💻 Colab has {N_CORES} CPU cores — using all of them.")
+
+# ── STEP 1: Bulk data fetch for every pair in parallel ──
+print("\n📥 Fetching 2 years of history per pair (cached to Drive)...")
+_t0 = time.time()
+
+def _fetch_pair(inst):
+    cache_path = os.path.join(DRIVE_DATA_DIR, f"{inst}_H1_2y.parquet")
+    df = fetcher.fetch_bulk_history(
+        instrument=inst,
+        years=BULK_HISTORY_YEARS,
+        granularity=TRADING_GRANULARITY,
+        cache_path=cache_path,
+    )
+    return inst, df
+
+raw_data = {}
+# Use threads (not processes) — CapitalClient session is not fork-safe
+with concurrent.futures.ThreadPoolExecutor(max_workers=min(N_CORES, len(INSTRUMENTS))) as ex:
+    futures = {ex.submit(_fetch_pair, inst): inst for inst in INSTRUMENTS}
+    for fut in concurrent.futures.as_completed(futures):
+        inst, df = fut.result()
+        if df is not None and len(df) >= 2000:
+            raw_data[inst] = df
+            print(f"  ✅ {inst}: {len(df):,} candles ({df.index[0].date()} → {df.index[-1].date()})")
+        else:
+            n = len(df) if df is not None else 0
+            print(f"  ⚠️  {inst}: only {n} candles — using what we have")
+            if df is not None and len(df) >= 300:
+                raw_data[inst] = df
+
+print(f"\n📥 Data fetch done in {time.time() - _t0:.0f}s")
+notifier.send(f"📥 Bulk data loaded: {len(raw_data)}/{len(INSTRUMENTS)} pairs ready", "info")
+
+# ── STEP 2: Parallel training with Drive checkpointing ──
+print("\n🧠 Starting parallel training (this will saturate all CPU cores)...")
+print("   Models are saved to Drive every 5 minutes.\n")
+
+_train_start = time.time()
+_checkpoint_interval = 300  # 5 minutes
+
+def _train_one_instrument(inst, df, sentiment_score):
+    """
+    Full training pipeline for one instrument.
+    Returns (inst, metrics) or (inst, None) on failure.
+    """
+    from src.features import compute_all_features
+    from src.regime import RegimeDetector
+    from src.ensemble import EnsembleEngine
+
+    try:
+        # Feature engineering
+        features = compute_all_features(df, sentiment=sentiment_score)
+        if features.empty:
+            return inst, None, f"feature engineering failed on {len(df)} candles"
+
+        # Fit HMM regime detector
+        hmm_path = os.path.join(DRIVE_MODELS_DIR, f"hmm_{inst}.joblib")
+        rd = RegimeDetector()
+        rd.fit(df, model_path=hmm_path)
+
+        # Train ensemble (walk-forward XGB + LGB)
+        ens_path = os.path.join(DRIVE_MODELS_DIR, f"ensemble_{inst}.joblib")
+        ens = EnsembleEngine(model_path=ens_path)
+        metrics = ens.train(features)
+
+        # Persist to Drive immediately
+        import joblib
+        joblib.dump(rd,  hmm_path)
+        joblib.dump(ens, ens_path)
+
+        return inst, ens, metrics
+
+    except Exception as e:
+        import traceback
+        return inst, None, traceback.format_exc()
+
+# Get current sentiment once (shared across pairs)
+_sentiment = scanner.get_composite_score()
+
+# Train all pairs in parallel — ProcessPoolExecutor would be faster but
+# scikit-learn/xgboost already use n_jobs=-1 internally, so threads suffice
+_train_results = {}
+_train_errors  = {}
+
+with concurrent.futures.ThreadPoolExecutor(max_workers=len(INSTRUMENTS)) as ex:
+    _futures = {
+        ex.submit(_train_one_instrument, inst, raw_data[inst], _sentiment): inst
+        for inst in raw_data
+    }
+
+    _completed = 0
+    _next_checkpoint_log = time.time() + _checkpoint_interval
+
+    for fut in concurrent.futures.as_completed(_futures):
+        inst = _futures[fut]
+        inst_out, ens_obj, metrics_or_err = fut.result()
+        _completed += 1
+
+        if ens_obj is not None:
+            # Plug trained objects into the live runtime
+            ensembles[inst_out]          = ens_obj
+            _train_results[inst_out]     = metrics_or_err
+            wf_acc = metrics_or_err.get("mean_wf_accuracy", 0)
+            n_samp = metrics_or_err.get("n_train_samples", 0)
+            print(f"  ✅ {inst_out}: WF accuracy={wf_acc:.4f} | n_samples={n_samp:,} "
+                  f"({_completed}/{len(raw_data)} done)")
+            logger.info(f"{inst_out} trained: acc={wf_acc:.4f} n={n_samp}")
+        else:
+            _train_errors[inst_out] = metrics_or_err
+            print(f"  ❌ {inst_out} FAILED: {str(metrics_or_err)[:120]}")
+            logger.error(f"{inst_out} training failed: {metrics_or_err}")
+
+        # Periodic checkpoint log
+        if time.time() > _next_checkpoint_log:
+            elapsed = time.time() - _train_start
+            print(f"\n  ⏱  Checkpoint: {_completed}/{len(raw_data)} pairs done | "
+                  f"elapsed={elapsed:.0f}s | {N_CORES} cores running\n")
+            _next_checkpoint_log = time.time() + _checkpoint_interval
+
+_total_train_time = time.time() - _train_start
+_summary_lines = []
+for inst, m in _train_results.items():
+    _summary_lines.append(
+        f"  {inst}: acc={m.get('mean_wf_accuracy',0):.4f} | "
+        f"n={m.get('n_train_samples',0):,} | "
+        f"top={[f[0] for f in m.get('top_features',[])[:2]]}"
+    )
+for inst, err in _train_errors.items():
+    _summary_lines.append(f"  {inst}: FAILED")
+
+_summary = "\n".join(_summary_lines)
+print(f"\n✅ Heavy training complete in {_total_train_time:.0f}s\n{_summary}")
+notifier.send(
+    f"🧠 Training done ({_total_train_time:.0f}s | {len(_train_results)}/{len(raw_data)} pairs)\n{_summary}",
+    "info"
+)
+
+# Reload regime detectors from saved models (they were trained in subthreads)
+import joblib as _joblib
+for inst in INSTRUMENTS:
+    hmm_path = os.path.join(DRIVE_MODELS_DIR, f"hmm_{inst}.joblib")
+    if os.path.exists(hmm_path):
         try:
-            # Fetch historical data
-            df = fetcher.fetch_candles(
-                inst, count=TRAINING_HISTORY_COUNT, granularity=TRADING_GRANULARITY
-            )
+            regime_detectors[inst] = _joblib.load(hmm_path)
+        except Exception:
+            pass  # keep the default empty one
 
-            if df is None or df.empty or len(df) < 500:
-                logger.warning(f"Insufficient data for {inst}. Skipping.")
-                results[inst] = "SKIPPED: insufficient data"
-                continue
-
-            # Fit regime detector
-            hmm_path = state.model_path(f"hmm_{inst}.joblib")
-            regime_detectors[inst].fit(df, model_path=hmm_path)
-
-            # Compute features and train ensemble
-            sentiment = scanner.get_composite_score()
-            features = compute_all_features(df, sentiment=sentiment)
-
-            if features.empty:
-                logger.warning(f"Feature engineering failed for {inst}.")
-                results[inst] = "SKIPPED: feature engineering failed"
-                continue
-
-            metrics = ensembles[inst].train(features)
-            results[inst] = {
-                "wf_accuracy": f"{metrics.get('mean_wf_accuracy', 0):.4f}",
-                "n_samples": metrics.get("n_train_samples", 0),
-                "top_features": [f[0] for f in metrics.get("top_features", [])[:3]],
-            }
-
-            logger.info(f"{inst} training complete: {results[inst]}")
-
-        except Exception as e:
-            logger.error(f"Training failed for {inst}: {e}", exc_info=True)
-            results[inst] = f"ERROR: {str(e)}"
-
-    # Send training summary
-    summary = "\n".join([f"  {k}: {v}" for k, v in results.items()])
-    notifier.send(f"📊 Retraining complete:\n{summary}", "info")
-    return results
-
-# Run the retraining
-training_results = daily_retrain()
-print("✅ Daily retraining complete.")
+print("✅ All components ready. Starting live trading loop...\n")
 
 # ─────────────────────────────────────────────
-# CELL 4: Live Trading Loop
+# CELL 4: Live Trading Loop (lean — models already trained)
 # ─────────────────────────────────────────────
 def live_trading_loop():
     """
-    Main continuous trading loop.
+    Lean live loop. Models are already trained; this just generates signals every 5 min.
 
-    For each instrument, every POLL_INTERVAL_SECONDS:
-      1. Fetch latest candle data
-      2. Compute features + sentiment
-      3. Detect current regime
-      4. Generate ensemble signal
-      5. Check risk management
-      6. Execute trade if approved
-      7. Log everything
+    Every cycle:
+      1. Fetch 300 recent candles per pair (fast, < 1s)
+      2. Compute features + regime + ensemble signal
+      3. Risk check → execute if approved
+      4. Every 24 cycles: refresh HMM on recent data
+      5. Every 60 cycles: performance report + save to Drive
     """
-    start_time = datetime.now()
-    end_time = start_time + timedelta(hours=MAX_RUNTIME_HOURS)
+    start_time  = datetime.now()
+    end_time    = start_time + timedelta(hours=MAX_RUNTIME_HOURS)
     candle_count = 0
-    trade_count = 0
+    trade_count  = 0
 
     notifier.send(
         f"🟢 Live trading started. Will run until {end_time.strftime('%H:%M:%S')} "
-        f"({MAX_RUNTIME_HOURS}h). Instruments: {', '.join(INSTRUMENTS)}",
+        f"({MAX_RUNTIME_HOURS}h). Pairs: {', '.join(INSTRUMENTS)}",
         "info"
     )
 
@@ -296,164 +408,146 @@ def live_trading_loop():
         candle_count += 1
 
         try:
-            # Update account balance
+            # Update balance
             balance = fetcher.get_account_balance()
-            if balance > 0:
+            if balance and balance > 0:
                 risk_mgr.update_balance(balance)
 
             if risk_mgr.is_halted:
                 notifier.send("🚨 Trading HALTED — max drawdown breached!", "error")
                 break
 
-            # Get current sentiment (shared across all instruments)
+            # Sentiment is cheap — get it once per cycle
             sentiment = scanner.get_composite_score()
 
             for inst in INSTRUMENTS:
                 try:
-                    # Skip if we already have an open position for this instrument
                     if executor.has_open_position(inst):
-                        logger.info(f"{inst}: Position already open. Skipping.")
+                        logger.info(f"{inst}: position open — skipping")
                         continue
 
-                    # Fetch recent data (enough for feature computation)
-                    df = fetcher.fetch_candles(
-                        inst, count=300, granularity=TRADING_GRANULARITY
-                    )
-                    if df is None or df.empty or len(df) < 250:
+                    # Fetch recent 300 candles for live features
+                    df = fetcher.fetch_candles(inst, count=300, granularity=TRADING_GRANULARITY)
+                    if df is None or len(df) < 250:
                         continue
 
-                    # Compute features
                     features = compute_all_features(df, sentiment=sentiment)
                     if features.empty:
                         continue
 
-                    # Detect regime
-                    regime = regime_detectors[inst].detect(df)
+                    regime  = regime_detectors[inst].detect(df)
                     weights = regime_detectors[inst].get_strategy_weights(regime)
+                    pred    = ensembles[inst].predict(features, regime, weights)
 
-                    # Get ensemble signal
-                    prediction = ensembles[inst].predict(features, regime, weights)
-                    signal = prediction["signal"]
-                    confidence = prediction["confidence"]
+                    signal     = pred["signal"]
+                    confidence = pred["confidence"]
 
                     if signal == "HOLD":
-                        logger.info(
-                            f"{inst}: HOLD | conf={confidence:.4f} | regime={regime['label']}"
-                        )
+                        logger.info(f"{inst}: HOLD | conf={confidence:.4f} | {regime['label']}")
                         continue
 
-                    # Risk management pre-trade check
-                    atr = features["atr_14"].iloc[-1]
+                    atr    = float(features["atr_14"].iloc[-1])
                     spread = fetcher.get_spread(inst)
                     approved, reason = risk_mgr.should_trade(confidence, atr, spread)
 
                     if not approved:
-                        logger.info(f"{inst}: Trade rejected — {reason}")
+                        logger.info(f"{inst}: rejected — {reason}")
                         continue
 
-                    # Calculate position size
-                    price = features["close"].iloc[-1]
-                    stats = journal.get_performance_stats()
-                    win_rate = stats.get("win_rate", 0.52)
-                    avg_wl = abs(stats.get("avg_win", 1.5) / stats.get("avg_loss", -1.0)) if stats.get("avg_loss", 0) != 0 else 1.5
+                    price   = float(features["close"].iloc[-1])
+                    stats   = journal.get_performance_stats()
+                    wr      = stats.get("win_rate", 0.52) or 0.52
+                    avg_wl  = (abs(stats.get("avg_win", 1.5)) / abs(stats.get("avg_loss", 1.0))
+                               if stats.get("avg_loss") else 1.5)
 
                     units = risk_mgr.calculate_position_size(
-                        balance=balance or 10000,
+                        balance=balance or 1000,
                         atr=atr,
                         price=price,
-                        win_rate=win_rate if win_rate > 0 else 0.52,
-                        avg_win_loss_ratio=avg_wl if avg_wl > 0 else 1.5,
-                        position_scale=prediction["position_scale"],
+                        win_rate=wr,
+                        avg_win_loss_ratio=max(avg_wl, 0.5),
+                        position_scale=pred["position_scale"],
                     )
-
                     if units <= 0:
                         continue
 
-                    # EXECUTE THE TRADE
                     result = executor.execute_market_order(
-                        instrument=inst,
-                        units=units,
-                        signal=signal,
-                        price=price,
-                        atr=atr,
+                        instrument=inst, size=units, signal=signal,
+                        price=price, atr=atr,
                     )
 
                     if "error" not in result:
                         trade_count += 1
                         journal.log_trade({
-                            "instrument": inst,
-                            "signal": signal,
-                            "price": price,
-                            "units": units,
-                            "atr": atr,
-                            "confidence": confidence,
+                            "instrument": inst, "signal": signal, "price": price,
+                            "units": units, "atr": atr, "confidence": confidence,
                             "regime": regime["label"],
-                            "stop_loss": result.get("stop_loss"),
+                            "stop_loss":  result.get("stop_loss"),
                             "take_profit": result.get("take_profit"),
-                            "ensemble_score": prediction["ensemble_score"],
+                            "ensemble_score": pred["ensemble_score"],
                         })
-
                         notifier.send(
-                            f"💹 {signal} {units} {inst} @ {price:.5f} | "
-                            f"SL={result.get('stop_loss', 'N/A')} | "
-                            f"TP={result.get('take_profit', 'N/A')} | "
-                            f"Conf={confidence:.2%} | Regime={regime['label']}",
+                            f"💹 {signal} {units:.2f}x {inst} @ {price:.5f} | "
+                            f"SL={result.get('stop_loss','?')} TP={result.get('take_profit','?')} | "
+                            f"conf={confidence:.2%} | {regime['label']}",
                             "trade"
                         )
 
                 except Exception as e:
-                    logger.error(f"Error processing {inst}: {e}", exc_info=True)
+                    logger.error(f"{inst} error: {e}", exc_info=True)
 
-            # Periodic HMM retraining (every N candles)
+            # Periodic light HMM refresh (only HMM, not XGB — fast)
             if candle_count % HMM_RETRAIN_INTERVAL == 0:
-                logger.info("Periodic HMM retraining...")
+                logger.info("Light HMM refresh on recent data...")
                 for inst in INSTRUMENTS:
                     try:
-                        df = fetcher.fetch_candles(inst, count=600, granularity=TRADING_GRANULARITY)
-                        if df is not None and len(df) >= 500:
-                            regime_detectors[inst].fit(df)
+                        df_r = fetcher.fetch_candles(inst, count=600, granularity=TRADING_GRANULARITY)
+                        if df_r is not None and len(df_r) >= 500:
+                            regime_detectors[inst].fit(df_r)
                     except Exception:
                         pass
 
-            # Periodic performance report
-            if candle_count % 60 == 0:  # Every ~5 hours at 5-min polling
+            # Performance + Drive save every ~5 hours
+            if candle_count % 60 == 0:
                 stats = journal.get_performance_stats()
                 notifier.send(
-                    f"📈 Performance update:\n"
-                    f"  Trades: {stats.get('total_trades', 0)} | "
-                    f"Win rate: {stats.get('win_rate', 0):.1%} | "
-                    f"PnL: ${stats.get('total_pnl', 0):.2f} | "
-                    f"Max DD: ${stats.get('max_drawdown', 0):.2f}",
+                    f"📈 {candle_count} cycles | trades={trade_count} | "
+                    f"WR={stats.get('win_rate',0):.1%} | "
+                    f"PnL=${stats.get('total_pnl',0):.2f} | "
+                    f"MaxDD=${stats.get('max_drawdown',0):.2f}",
                     "info"
                 )
+                # Persist journal to Drive
+                try:
+                    state.save()
+                except Exception:
+                    pass
 
         except Exception as e:
-            logger.error(f"Error in main loop: {e}", exc_info=True)
-            notifier.send(f"🚨 Main loop error: {str(e)}", "error")
+            logger.error(f"Main loop error: {e}", exc_info=True)
+            notifier.send(f"🚨 Loop error: {e}", "error")
 
-        # Sleep until next poll
-        elapsed = time.time() - cycle_start
+        elapsed    = time.time() - cycle_start
         sleep_time = max(0, POLL_INTERVAL_SECONDS - elapsed)
-        logger.info(f"Cycle complete ({elapsed:.1f}s). Sleeping {sleep_time:.0f}s...")
+        logger.info(f"Cycle {candle_count} done ({elapsed:.1f}s). Sleeping {sleep_time:.0f}s...")
         time.sleep(sleep_time)
 
-    # ── GRACEFUL SHUTDOWN ──
-    logger.info("="*60)
-    logger.info("GRACEFUL SHUTDOWN — Runtime limit reached")
-    logger.info("="*60)
-
-    # Final performance report
+    # ── Graceful shutdown ──
+    logger.info("="*60 + "\nGRACEFUL SHUTDOWN\n" + "="*60)
     stats = journal.get_performance_stats()
-    shutdown_msg = (
-        f"⏹️ Graceful shutdown after {MAX_RUNTIME_HOURS}h.\n"
-        f"  Candles processed: {candle_count}\n"
-        f"  Trades executed: {trade_count}\n"
+    msg   = (
+        f"⏹️ Shutdown after {MAX_RUNTIME_HOURS}h.\n"
+        f"  Cycles: {candle_count} | Trades: {trade_count}\n"
         f"  Final stats: {stats}"
     )
-    notifier.send(shutdown_msg, "info")
-    logger.info(shutdown_msg)
+    notifier.send(msg, "info")
+    logger.info(msg)
+    try:
+        state.save()
+    except Exception:
+        pass
 
 
-# START THE LOOP
+# START
 live_trading_loop()
-print("\n✅ Session complete. Restart this notebook to begin a new session.")
+print("\n✅ Session complete. Restart notebook to begin a new session.")

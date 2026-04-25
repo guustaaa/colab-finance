@@ -37,8 +37,11 @@ INSTRUMENTS = [
 TRADING_GRANULARITY = "H1"  # 1-hour candles — best noise/signal tradeoff for retail
 TRAINING_GRANULARITY = "H1"
 
-# Number of candles for training history
-TRAINING_HISTORY_COUNT = 4000  # ~6 months of H1 data
+# Number of candles for live-loop feature computation (recent window)
+TRAINING_HISTORY_COUNT = 1000  # candles used in live loop for signal generation
+
+# Years of history to pull for initial training (bulk fetch)
+BULK_HISTORY_YEARS = 2.0  # ~17,500 H1 candles per pair
 
 # ─────────────────────────────────────────────
 # RISK MANAGEMENT
@@ -89,24 +92,46 @@ HMM_RETRAIN_INTERVAL = 24 # retrain every 24 candles (1 day on H1)
 
 # ─────────────────────────────────────────────
 # XGBOOST META-LEARNER
+# Tuned for max Colab CPU utilisation (all cores, large ensembles)
 # ─────────────────────────────────────────────
+import os as _os
+_N_JOBS = int(_os.getenv("N_JOBS", "-1"))  # -1 = use all CPU cores
+
 XGB_PARAMS = {
-    "n_estimators": 200,
-    "learning_rate": 0.03,
-    "max_depth": 4,
-    "subsample": 0.7,
-    "colsample_bytree": 0.7,
-    "min_child_weight": 5,
-    "reg_alpha": 0.1,     # L1 regularization — prevents overfitting on noise
-    "reg_lambda": 1.0,    # L2 regularization
+    "n_estimators": 1000,       # 5x more trees — better averaging of weak learners
+    "learning_rate": 0.01,      # lower LR → needs more trees but generalises better
+    "max_depth": 6,             # deeper trees for complex FX patterns
+    "subsample": 0.8,
+    "colsample_bytree": 0.6,
+    "min_child_weight": 3,
+    "reg_alpha": 0.05,
+    "reg_lambda": 1.5,
     "random_state": 42,
     "eval_metric": "logloss",
+    "n_jobs": _N_JOBS,          # saturate all CPU cores
+    "tree_method": "hist",      # fastest CPU method
+    "early_stopping_rounds": 50,  # stop when val loss stops improving
 }
 
-# Walk-forward validation
-WALK_FORWARD_TRAIN_SIZE = 2000  # candles
-WALK_FORWARD_TEST_SIZE = 200    # candles (~8 days of H1)
-WALK_FORWARD_STEP = 200         # retrain every 200 candles
+LGB_PARAMS = {
+    "n_estimators": 1000,
+    "learning_rate": 0.01,
+    "max_depth": 6,
+    "num_leaves": 63,
+    "subsample": 0.8,
+    "colsample_bytree": 0.6,
+    "min_child_samples": 20,
+    "reg_alpha": 0.05,
+    "reg_lambda": 1.5,
+    "random_state": 42,
+    "n_jobs": _N_JOBS,
+    "verbose": -1,
+}
+
+# Walk-forward validation — much larger windows now we have 2y of data
+WALK_FORWARD_TRAIN_SIZE = 10000  # ~14 months of H1
+WALK_FORWARD_TEST_SIZE  = 500    # ~3 weeks
+WALK_FORWARD_STEP       = 500    # retrain every 3 weeks of data
 
 # ─────────────────────────────────────────────
 # SENTIMENT

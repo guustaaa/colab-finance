@@ -30,7 +30,7 @@ import logging
 from sklearn.model_selection import TimeSeriesSplit
 
 from src.features import get_feature_columns
-from src.config import XGB_PARAMS, WALK_FORWARD_TRAIN_SIZE, WALK_FORWARD_TEST_SIZE
+from src.config import XGB_PARAMS, LGB_PARAMS, WALK_FORWARD_TRAIN_SIZE, WALK_FORWARD_TEST_SIZE
 
 logger = logging.getLogger("ensemble")
 
@@ -184,7 +184,7 @@ class XGBoostPredictor:
             X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
             y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
 
-            # XGBoost
+            # XGBoost — needs eval_set for early stopping
             xgb_model = xgb.XGBClassifier(**XGB_PARAMS)
             xgb_model.fit(
                 X_train, y_train,
@@ -197,24 +197,25 @@ class XGBoostPredictor:
             logger.info(f"Walk-forward fold {fold + 1}: accuracy = {score:.4f}")
 
         # ── Final Training on Full Dataset ──
-        # XGBoost
-        self.model = xgb.XGBClassifier(**XGB_PARAMS)
-        self.model.fit(X, y, verbose=False)
+        # Reserve last 15% as validation for early stopping
+        split = max(1, int(len(X) * 0.85))
+        X_tr, X_val = X.iloc[:split], X.iloc[split:]
+        y_tr, y_val = y.iloc[:split], y.iloc[split:]
 
-        # LightGBM (for ensemble diversity)
-        self.lgb_model = lgb.LGBMClassifier(
-            n_estimators=200,
-            learning_rate=0.03,
-            max_depth=4,
-            subsample=0.7,
-            colsample_bytree=0.7,
-            min_child_weight=5,
-            reg_alpha=0.1,
-            reg_lambda=1.0,
-            random_state=42,
-            verbose=-1,
+        self.model = xgb.XGBClassifier(**XGB_PARAMS)
+        self.model.fit(
+            X_tr, y_tr,
+            eval_set=[(X_val, y_val)],
+            verbose=False,
         )
-        self.lgb_model.fit(X, y)
+
+        # LightGBM (for ensemble diversity) — use config params
+        self.lgb_model = lgb.LGBMClassifier(**LGB_PARAMS)
+        self.lgb_model.fit(
+            X_tr, y_tr,
+            eval_set=[(X_val, y_val)],
+            callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(period=-1)],
+        )
 
         # Save models
         if self.model_path:
