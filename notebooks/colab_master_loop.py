@@ -225,10 +225,26 @@ from src.config import (
     MAX_RUNTIME_HOURS, POLL_INTERVAL_SECONDS, WEBHOOK_URL,
     HMM_RETRAIN_INTERVAL, BULK_HISTORY_YEARS,
     DRIVE_DATA_DIR, DRIVE_MODELS_DIR,
+    COMPUTE_DEVICE,
 )
 
 N_CORES = multiprocessing.cpu_count()
-print(f"💻 Colab has {N_CORES} CPU cores — using all of them.")
+
+# ── Device banner ──
+# To force a device, add a Colab Secret or set before running:
+#   COMPUTE_DEVICE = cpu | gpu | tpu
+# Auto-detection: checks nvidia-smi for GPU, else CPU.
+# NOTE: TPU v5e → XGBoost/LGB run on CPU (they don't support TPU).
+#       Set COMPUTE_DEVICE=tpu to get 2000-tree deeper models on CPU.
+print(f"💻  CPU cores : {N_CORES}")
+print(f"⚙️  Device    : {COMPUTE_DEVICE.upper()}")
+if COMPUTE_DEVICE == "tpu":
+    print("   ℹ️  TPU detected — XGBoost/LGB use maxed CPU config (2000 trees).")
+    print("      JAX-based models will use TPU in a future update.")
+elif COMPUTE_DEVICE == "gpu":
+    print("   🚀 GPU detected — XGBoost CUDA + LightGBM GPU enabled!")
+else:
+    print("   ℹ️  CPU mode — all cores active via n_jobs=-1.")
 
 # ── STEP 1: Bulk data fetch for every pair in parallel ──
 print("\n📥 Fetching 2 years of history per pair (cached to Drive)...")

@@ -90,48 +90,130 @@ HMM_N_STATES = 3          # low-vol trending, high-vol trending, crisis/choppy
 HMM_LOOKBACK = 500        # candles of data to fit HMM on
 HMM_RETRAIN_INTERVAL = 24 # retrain every 24 candles (1 day on H1)
 
-# ─────────────────────────────────────────────
-# XGBOOST META-LEARNER
-# Tuned for max Colab CPU utilisation (all cores, large ensembles)
-# ─────────────────────────────────────────────
 import os as _os
-_N_JOBS = int(_os.getenv("N_JOBS", "-1"))  # -1 = use all CPU cores
 
-XGB_PARAMS = {
-    "n_estimators": 1000,       # 5x more trees — better averaging of weak learners
-    "learning_rate": 0.01,      # lower LR → needs more trees but generalises better
-    "max_depth": 6,             # deeper trees for complex FX patterns
-    "subsample": 0.8,
-    "colsample_bytree": 0.6,
-    "min_child_weight": 3,
-    "reg_alpha": 0.05,
-    "reg_lambda": 1.5,
-    "random_state": 42,
-    "eval_metric": "logloss",
-    "n_jobs": _N_JOBS,          # saturate all CPU cores
-    "tree_method": "hist",      # fastest CPU method
-    "early_stopping_rounds": 50,  # stop when val loss stops improving
-}
+# ─────────────────────────────────────────────
+# DEVICE  ─  set env var COMPUTE_DEVICE to override:
+#   COMPUTE_DEVICE=cpu   → all CPU cores
+#   COMPUTE_DEVICE=gpu   → XGBoost CUDA + LGB GPU
+#   COMPUTE_DEVICE=tpu   → best CPU config (XGB/LGB don’t run on TPU natively;
+#                          the TPU is leveraged by future JAX/TF layers)
+# Auto-detects CUDA if not set.
+# ─────────────────────────────────────────────
+def _detect_device() -> str:
+    explicit = _os.getenv("COMPUTE_DEVICE", "").lower()
+    if explicit in ("cpu", "gpu", "tpu"):
+        return explicit
+    try:
+        import subprocess
+        out = subprocess.run(["nvidia-smi"], capture_output=True)
+        if out.returncode == 0:
+            return "gpu"
+    except FileNotFoundError:
+        pass
+    return "cpu"
 
-LGB_PARAMS = {
-    "n_estimators": 1000,
-    "learning_rate": 0.01,
-    "max_depth": 6,
-    "num_leaves": 63,
-    "subsample": 0.8,
-    "colsample_bytree": 0.6,
-    "min_child_samples": 20,
-    "reg_alpha": 0.05,
-    "reg_lambda": 1.5,
-    "random_state": 42,
-    "n_jobs": _N_JOBS,
-    "verbose": -1,
-}
+COMPUTE_DEVICE: str = _detect_device()
+_N_JOBS = int(_os.getenv("N_JOBS", "-1"))  # -1 = all cores
 
-# Walk-forward validation — much larger windows now we have 2y of data
+# Build XGB/LGB params based on detected device
+if COMPUTE_DEVICE == "gpu":
+    XGB_PARAMS = {
+        "n_estimators": 1000,
+        "learning_rate": 0.01,
+        "max_depth": 8,          # GPUs handle deeper trees efficiently
+        "subsample": 0.8,
+        "colsample_bytree": 0.6,
+        "min_child_weight": 3,
+        "reg_alpha": 0.05,
+        "reg_lambda": 1.5,
+        "random_state": 42,
+        "eval_metric": "logloss",
+        "tree_method": "hist",
+        "device": "cuda",        # XGBoost ≥ 2.0 GPU flag
+        "early_stopping_rounds": 50,
+    }
+    LGB_PARAMS = {
+        "n_estimators": 1000,
+        "learning_rate": 0.01,
+        "max_depth": 8,
+        "num_leaves": 127,
+        "subsample": 0.8,
+        "colsample_bytree": 0.6,
+        "min_child_samples": 20,
+        "reg_alpha": 0.05,
+        "reg_lambda": 1.5,
+        "random_state": 42,
+        "device": "gpu",         # LightGBM GPU flag
+        "verbose": -1,
+    }
+elif COMPUTE_DEVICE == "tpu":
+    # XGBoost/LGB don’t support TPU — use maxed-out CPU config.
+    # The TPU quota is available for future JAX-based layers.
+    XGB_PARAMS = {
+        "n_estimators": 2000,    # More trees to compensate for no GPU
+        "learning_rate": 0.005,
+        "max_depth": 6,
+        "subsample": 0.8,
+        "colsample_bytree": 0.6,
+        "min_child_weight": 3,
+        "reg_alpha": 0.05,
+        "reg_lambda": 1.5,
+        "random_state": 42,
+        "eval_metric": "logloss",
+        "n_jobs": _N_JOBS,
+        "tree_method": "hist",
+        "early_stopping_rounds": 100,
+    }
+    LGB_PARAMS = {
+        "n_estimators": 2000,
+        "learning_rate": 0.005,
+        "max_depth": 6,
+        "num_leaves": 63,
+        "subsample": 0.8,
+        "colsample_bytree": 0.6,
+        "min_child_samples": 20,
+        "reg_alpha": 0.05,
+        "reg_lambda": 1.5,
+        "random_state": 42,
+        "n_jobs": _N_JOBS,
+        "verbose": -1,
+    }
+else:  # cpu
+    XGB_PARAMS = {
+        "n_estimators": 1000,
+        "learning_rate": 0.01,
+        "max_depth": 6,
+        "subsample": 0.8,
+        "colsample_bytree": 0.6,
+        "min_child_weight": 3,
+        "reg_alpha": 0.05,
+        "reg_lambda": 1.5,
+        "random_state": 42,
+        "eval_metric": "logloss",
+        "n_jobs": _N_JOBS,
+        "tree_method": "hist",
+        "early_stopping_rounds": 50,
+    }
+    LGB_PARAMS = {
+        "n_estimators": 1000,
+        "learning_rate": 0.01,
+        "max_depth": 6,
+        "num_leaves": 63,
+        "subsample": 0.8,
+        "colsample_bytree": 0.6,
+        "min_child_samples": 20,
+        "reg_alpha": 0.05,
+        "reg_lambda": 1.5,
+        "random_state": 42,
+        "n_jobs": _N_JOBS,
+        "verbose": -1,
+    }
+
+# Walk-forward validation windows
 WALK_FORWARD_TRAIN_SIZE = 10000  # ~14 months of H1
 WALK_FORWARD_TEST_SIZE  = 500    # ~3 weeks
-WALK_FORWARD_STEP       = 500    # retrain every 3 weeks of data
+WALK_FORWARD_STEP       = 500
 
 # ─────────────────────────────────────────────
 # SENTIMENT
