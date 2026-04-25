@@ -68,6 +68,8 @@ REPO_DIR = "/content/colab-finance"
 
 def sync_repo():
     """Self-healing repo sync: always ends with a clean, up-to-date clone."""
+    # Reset CWD — a previous run may have chdir'd into the repo dir we're about to delete
+    os.chdir("/content")
     if os.path.isdir(os.path.join(REPO_DIR, ".git")):
         # Directory exists with a valid .git — try to pull latest
         result = subprocess.run(
