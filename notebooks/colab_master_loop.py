@@ -61,18 +61,42 @@ for subdir in ["models", "logs", "data"]:
     os.makedirs(os.path.join(STATE_DIR, subdir), exist_ok=True)
 print(f"✅ State directory ready: {STATE_DIR}")
 
-# Clone or pull the repository
-import subprocess
+import subprocess, shutil
 
 REPO_URL = "https://github.com/guustaaa/colab-finance.git"
 REPO_DIR = "/content/colab-finance"
 
-if os.path.exists(REPO_DIR):
-    subprocess.run(["git", "-C", REPO_DIR, "pull"], check=True)
-    print("✅ Repository updated.")
-else:
-    subprocess.run(["git", "clone", REPO_URL, REPO_DIR], check=True)
+def sync_repo():
+    """Self-healing repo sync: always ends with a clean, up-to-date clone."""
+    if os.path.isdir(os.path.join(REPO_DIR, ".git")):
+        # Directory exists with a valid .git — try to pull latest
+        result = subprocess.run(
+            ["git", "-C", REPO_DIR, "pull", "--ff-only"],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            print("✅ Repository updated (git pull).")
+            return
+        # Pull failed (dirty state, merge conflict, etc.) — nuke and re-clone
+        print(f"⚠️  Pull failed ({result.stderr.strip()}). Re-cloning fresh...")
+
+    # Remove any leftover directory (corrupted clone, partial download, etc.)
+    if os.path.exists(REPO_DIR):
+        shutil.rmtree(REPO_DIR)
+
+    # Fresh clone
+    result = subprocess.run(
+        ["git", "clone", REPO_URL, REPO_DIR],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"❌ Git clone failed:\n{result.stderr}\n"
+            f"Make sure the repo is public: {REPO_URL}"
+        )
     print("✅ Repository cloned.")
+
+sync_repo()
 
 os.chdir(REPO_DIR)
 os.system("pip install -r requirements.txt -q")
