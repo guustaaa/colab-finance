@@ -2,7 +2,7 @@
 test_pipeline.py — End-to-end tests for the trading pipeline.
 
 Tests the full flow: mock data → features → regime → ensemble → risk → backtest
-All tests use mock data so they run without OANDA credentials.
+All tests use mock data so they run without Capital.com credentials.
 """
 import sys
 import os

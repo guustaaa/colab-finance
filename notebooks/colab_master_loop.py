@@ -110,10 +110,10 @@ print("✅ Dependencies installed.")
 # ─────────────────────────────────────────────
 from google.colab import userdata
 
-# Required secrets: OANDA_ACCESS_TOKEN, OANDA_ACCOUNT_ID
+# Required secrets: CAPITAL_API_KEY, CAPITAL_EMAIL, CAPITAL_PASSWORD
 # Optional secret:  WEBHOOK_URL (for Discord/Slack notifications)
 _missing_secrets = []
-for secret_name in ["OANDA_ACCESS_TOKEN", "OANDA_ACCOUNT_ID", "WEBHOOK_URL"]:
+for secret_name in ["CAPITAL_API_KEY", "CAPITAL_EMAIL", "CAPITAL_PASSWORD", "WEBHOOK_URL"]:
     try:
         val = userdata.get(secret_name)
         if val:
@@ -134,9 +134,10 @@ if _missing_secrets:
     raise RuntimeError(
         f"❌ Cannot start: missing required secrets: {_missing_secrets}\n"
         f"   Add them via the 🔑 Secrets panel in the left sidebar.\n\n"
-        f"   OANDA_ACCESS_TOKEN → Your API token from https://www.oanda.com/demo-account/tpa/personal_token\n"
-        f"   OANDA_ACCOUNT_ID   → Your account ID (looks like '101-004-12345678-001')\n"
-        f"                        Find it at: OANDA Dashboard → Manage Funds → top of page"
+        f"   CAPITAL_API_KEY  → Go to capital.com → Settings → API integrations → Generate new key\n"
+        f"   CAPITAL_EMAIL    → Your Capital.com login email\n"
+        f"   CAPITAL_PASSWORD → The CUSTOM PASSWORD you set when generating the API key\n"
+        f"                      (NOT your account login password!)"
     )
 
 # ─────────────────────────────────────────────
@@ -151,12 +152,12 @@ from src.config import (
     MAX_RUNTIME_HOURS, POLL_INTERVAL_SECONDS, WEBHOOK_URL,
     HMM_RETRAIN_INTERVAL,
 )
-from src.data_fetcher import OandaFetcher
+from src.data_fetcher import CapitalFetcher
 from src.features import compute_all_features
 from src.sentiment import SentimentScanner
 from src.regime import RegimeDetector
 from src.ensemble import EnsembleEngine
-from src.execution import RiskManager, OandaExecutor
+from src.execution import RiskManager, CapitalExecutor
 from src.utils import Notifier, StateManager, TradeJournal, setup_logger
 
 # Setup logging
@@ -166,27 +167,27 @@ logger = setup_logger("colab_master", log_dir)
 # Initialize all components
 notifier = Notifier(WEBHOOK_URL)
 state = StateManager()
-fetcher = OandaFetcher()
+fetcher = CapitalFetcher(demo=True)
 scanner = SentimentScanner()
-executor = OandaExecutor()
+executor = CapitalExecutor(client=fetcher.client)
 
 # ─────────────────────────────────────────────
-# Pre-flight: verify OANDA credentials work
+# Pre-flight: verify Capital.com credentials work
 # ─────────────────────────────────────────────
-print("\n🔍 Verifying OANDA credentials...")
+print("\n🔍 Verifying Capital.com credentials...")
 _balance = fetcher.get_account_balance()
 if _balance is None or _balance <= 0:
     raise RuntimeError(
-        "❌ OANDA authentication FAILED. The bot will NOT start.\n\n"
+        "❌ Capital.com authentication FAILED. The bot will NOT start.\n\n"
         "   Check your Colab Secrets (🔑 left sidebar):\n"
-        f"   OANDA_ACCOUNT_ID   = '{os.environ.get('OANDA_ACCOUNT_ID', '')}'\n"
-        f"   OANDA_ACCESS_TOKEN = '{os.environ.get('OANDA_ACCESS_TOKEN', '')[:8]}...'\n\n"
+        f"   CAPITAL_API_KEY  = '{os.environ.get('CAPITAL_API_KEY', '')[:12]}...'\n"
+        f"   CAPITAL_EMAIL    = '{os.environ.get('CAPITAL_EMAIL', '')}'\n\n"
         "   Common fixes:\n"
-        "   1. Account ID format should be like '101-004-12345678-001' (not a word)\n"
-        "   2. Token must be from the SAME account type (Practice vs Live)\n"
-        "   3. Generate a new token at: https://www.oanda.com/demo-account/tpa/personal_token"
+        "   1. CAPITAL_PASSWORD must be the CUSTOM API KEY password, NOT your login password\n"
+        "   2. Make sure 2FA is enabled on your Capital.com account\n"
+        "   3. Check if the API key is active (not paused/expired) in Settings → API integrations"
     )
-print(f"✅ OANDA connected! Account balance: ${_balance:,.2f}")
+print(f"✅ Capital.com connected! Account balance: ${_balance:,.2f}")
 
 risk_mgr = RiskManager(initial_balance=_balance)
 journal = TradeJournal(state)
@@ -210,7 +211,7 @@ print("✅ All components initialized.")
 def daily_retrain():
     """
     Train the HMM regime detector and XGBoost ensemble for each instrument.
-    Uses the latest available historical data from OANDA.
+    Uses the latest available historical data from Capital.com.
     """
     notifier.send("📊 Starting daily retraining routine...", "info")
     results = {}

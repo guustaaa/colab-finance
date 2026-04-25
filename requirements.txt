@@ -15,8 +15,8 @@ ta>=0.10.0
 feedparser>=6.0.10
 vaderSentiment>=3.3.2
 
-# === OANDA Broker API ===
-oandapyV20>=0.7.2
+# === Capital.com Broker API ===
+# Uses `requests` (listed below) — no third-party SDK needed
 
 # === Environment & Config ===
 python-dotenv>=1.0.0

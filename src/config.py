@@ -11,11 +11,12 @@ load_dotenv()
 
 
 # ─────────────────────────────────────────────
-# OANDA API
+# CAPITAL.COM API
 # ─────────────────────────────────────────────
-OANDA_TOKEN = os.getenv("OANDA_ACCESS_TOKEN", "")
-OANDA_ACCOUNT = os.getenv("OANDA_ACCOUNT_ID", "")
-OANDA_ENV = os.getenv("OANDA_ENVIRONMENT", "practice")
+CAPITAL_API_KEY = os.getenv("CAPITAL_API_KEY", "")
+CAPITAL_EMAIL = os.getenv("CAPITAL_EMAIL", "")
+CAPITAL_PASSWORD = os.getenv("CAPITAL_PASSWORD", "")
+CAPITAL_DEMO = os.getenv("CAPITAL_DEMO", "true").lower() == "true"
 
 # ─────────────────────────────────────────────
 # INSTRUMENTS
@@ -44,15 +45,15 @@ TRAINING_HISTORY_COUNT = 4000  # ~6 months of H1 data
 # Based on Kelly Criterion with fractional sizing
 # ─────────────────────────────────────────────
 KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.25"))
-MAX_RISK_PER_TRADE = float(os.getenv("MAX_RISK_PCT", "0.01"))  # 1% of account
-MAX_DRAWDOWN = float(os.getenv("MAX_DRAWDOWN_PCT", "0.10"))     # 10% max drawdown → halt
+RISK_PER_TRADE = float(os.getenv("MAX_RISK_PCT", "0.01"))  # 1% of account
+MAX_DRAWDOWN = float(os.getenv("MAX_DRAWDOWN_PCT", "0.10"))  # 10% max drawdown → halt
 
 # ATR-based stop loss / take profit multipliers
-ATR_SL_MULTIPLIER = 1.5   # Stop loss at 1.5x ATR
-ATR_TP_MULTIPLIER = 2.5   # Take profit at 2.5x ATR (risk:reward = 1:1.67)
+SL_ATR_MULTIPLIER = 1.5   # Stop loss at 1.5x ATR
+TP_ATR_MULTIPLIER = 2.5   # Take profit at 2.5x ATR (risk:reward = 1:1.67)
 
-# Minimum expected profit (in pips) after spread to take a trade
-MIN_EDGE_AFTER_COSTS = 3.0  # pips — filters out low-conviction signals
+# Minimum confidence to execute a trade
+MIN_CONFIDENCE_THRESHOLD = float(os.getenv("MIN_CONFIDENCE", "0.55"))
 
 # ─────────────────────────────────────────────
 # FACTOR MODEL PARAMETERS
@@ -67,7 +68,7 @@ MOMENTUM_SLOW_PERIOD = 168   # 1 week of H1
 MOMENTUM_SIGNAL_PERIOD = 720 # 1 month of H1
 
 # Carry proxy — interest rate differential approximation
-# In practice, we use the swap rate from OANDA (overnight financing charges)
+# In practice, we use the swap rate from Capital.com (overnight financing charges)
 # For now, approximated from forward-spot differential
 
 # Value — PPP deviation

@@ -19,7 +19,7 @@
 ## Architecture
 
 ```
-OANDA Data → Feature Engineering → [Economic Factors + Technical + Sentiment]
+Capital.com Data → Feature Engineering → [Economic Factors + Technical + Sentiment]
                                               ↓
                                     HMM Regime Detector
                                               ↓
@@ -28,7 +28,7 @@ OANDA Data → Feature Engineering → [Economic Factors + Technical + Sentiment
                                               ↓
                               Risk Manager (Kelly + ATR + Drawdown)
                                               ↓
-                              OANDA Execution (or HOLD)
+                              Capital.com Execution (or HOLD)
                                               ↓
                               Trade Journal → Walk-Forward Retrainer
 ```
@@ -47,10 +47,10 @@ OANDA Data → Feature Engineering → [Economic Factors + Technical + Sentiment
 
 ## Quick Start
 
-### 1. Setup OANDA Demo Account
-1. Go to [OANDA Demo](https://www.oanda.com/demo-account/)
-2. Create a free practice account
-3. Go to **Manage API Access** → generate a personal access token
+### 1. Setup Capital.com Demo Account
+1. Go to [Capital.com](https://capital.com/)
+2. Create a free practice account and enable 2FA
+3. Go to **Settings → API integrations** → Generate a new key and set a custom password
 4. Copy `.env.example` to `.env` and fill in your credentials
 
 ### 2. Run in Google Colab (Zero Local Hardware)
@@ -81,12 +81,12 @@ print(metrics)
 ```
 ├── src/
 │   ├── config.py          # All tunable parameters (documented with citations)
-│   ├── data_fetcher.py    # OANDA V20 API interface
+│   ├── data_fetcher.py    # Capital.com REST API interface
 │   ├── features.py        # Feature engineering (economic factors + technical)
 │   ├── sentiment.py       # RSS news sentiment scanner (VADER)
 │   ├── regime.py          # HMM regime detector (3-state)
 │   ├── ensemble.py        # Factor Model + XGBoost + LightGBM ensemble
-│   ├── execution.py       # OANDA trade execution + risk management
+│   ├── execution.py       # Capital.com trade execution + risk management
 │   ├── backtester.py      # Walk-forward backtesting engine
 │   └── utils.py           # Notifications, state management, trade journal
 ├── notebooks/

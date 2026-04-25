@@ -20,8 +20,8 @@ from src.ensemble import EnsembleEngine
 from src.regime import RegimeDetector
 from src.config import (
     WALK_FORWARD_TRAIN_SIZE, WALK_FORWARD_TEST_SIZE, WALK_FORWARD_STEP,
-    ATR_SL_MULTIPLIER, ATR_TP_MULTIPLIER,
-    KELLY_FRACTION, MAX_RISK_PER_TRADE,
+    SL_ATR_MULTIPLIER, TP_ATR_MULTIPLIER,
+    KELLY_FRACTION, RISK_PER_TRADE,
 )
 
 logger = logging.getLogger("backtester")
@@ -206,12 +206,12 @@ class Backtester:
         cost = self.spread + self.slippage
 
         # Position sizing (simplified Kelly)
-        risk_pct = min(KELLY_FRACTION * confidence, MAX_RISK_PER_TRADE)
+        risk_pct = min(KELLY_FRACTION * confidence, RISK_PER_TRADE)
         risk_amount = balance * risk_pct
         position_scale = regime_weights.get("position_scale", 0.5)
 
-        sl_distance = atr * ATR_SL_MULTIPLIER
-        tp_distance = atr * ATR_TP_MULTIPLIER
+        sl_distance = atr * SL_ATR_MULTIPLIER
+        tp_distance = atr * TP_ATR_MULTIPLIER
 
         if sl_distance <= 0:
             return None
