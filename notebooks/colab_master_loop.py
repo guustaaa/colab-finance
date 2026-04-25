@@ -248,12 +248,12 @@ else:
     print("   ℹ️  CPU mode — all cores active via n_jobs=-1.")
 
 # ── STEP 1: Bulk data fetch ──
-# Nuke any poisoned caches (< 500 candles) from previous failed runs
+# Nuke truly poisoned caches (< 100 candles = from 429 failures)
 import glob as _glob
 for _pq in _glob.glob(os.path.join(DRIVE_DATA_DIR, "*_H1_2y.parquet")):
     try:
         _tmp = pd.read_parquet(_pq)
-        if len(_tmp) < 500:
+        if len(_tmp) < 100:
             os.remove(_pq)
             print(f"  🗑️  Deleted poisoned cache: {os.path.basename(_pq)} ({len(_tmp)} candles)")
     except Exception:
@@ -271,10 +271,10 @@ for _inst in INSTRUMENTS:
         granularity=TRADING_GRANULARITY,
         cache_path=_cache,
     )
-    if _df is not None and len(_df) >= 300:
+    if _df is not None and len(_df) >= 200:
         raw_data[_inst] = _df
-        _tag = f"{_df.index[0].date()} → {_df.index[-1].date()}" if len(_df) >= 2000 else f"only {len(_df)} candles"
-        _icon = "✅" if len(_df) >= 2000 else "⚠️ "
+        _tag = f"{_df.index[0].date()} → {_df.index[-1].date()}"
+        _icon = "✅" if len(_df) >= 500 else "⚠️ "
         print(f"  {_icon} {_inst}: {len(_df):,} candles ({_tag})")
     else:
         print(f"  ❌ {_inst}: no usable data")

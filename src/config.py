@@ -104,6 +104,9 @@ def _detect_device() -> str:
     explicit = _os.getenv("COMPUTE_DEVICE", "").lower()
     if explicit in ("cpu", "gpu", "tpu"):
         return explicit
+    # Check for TPU (Colab sets these env vars for TPU runtimes)
+    if _os.getenv("COLAB_TPU_ADDR") or _os.getenv("TPU_NAME") or _os.getenv("TPU_WORKER_HOSTNAMES"):
+        return "tpu"
     try:
         import subprocess
         out = subprocess.run(["nvidia-smi"], capture_output=True)
@@ -211,9 +214,9 @@ else:  # cpu
     }
 
 # Walk-forward validation windows
-WALK_FORWARD_TRAIN_SIZE = 10000  # ~14 months of H1
-WALK_FORWARD_TEST_SIZE  = 500    # ~3 weeks
-WALK_FORWARD_STEP       = 500
+WALK_FORWARD_TRAIN_SIZE = 400   # Fits Capital.com demo history (~600 candles)
+WALK_FORWARD_TEST_SIZE  = 100   # ~4 days of H1
+WALK_FORWARD_STEP       = 100
 
 # ─────────────────────────────────────────────
 # SENTIMENT

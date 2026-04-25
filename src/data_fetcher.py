@@ -296,7 +296,7 @@ class CapitalFetcher:
         if cache_path and os.path.exists(cache_path):
             try:
                 cached = pd.read_parquet(cache_path)
-                if not cached.empty and len(cached) >= 300:
+                if not cached.empty and len(cached) >= 200:
                     age_hours = (pd.Timestamp.now(tz="UTC") - cached.index[-1]).total_seconds() / 3600
                     if age_hours < 24:
                         logger.info(f"[{instrument}] Loaded {len(cached)} candles from cache (age {age_hours:.1f}h)")
@@ -341,10 +341,15 @@ class CapitalFetcher:
 
             if data is None or not data.get("prices"):
                 consecutive_empty += 1
-                if consecutive_empty >= 3:
-                    logger.warning(f"[{instrument}] 3 empty batches in a row — stopping early at batch {batch_num}")
+                # If we already have data, a 404/empty means end of available history
+                if all_frames:
+                    logger.info(f"[{instrument}] No more history available — stopping at batch {batch_num}")
                     break
-                to_dt = from_dt  # move window back anyway
+                if consecutive_empty >= 3:
+                    logger.warning(f"[{instrument}] 3 empty batches with no data at all — giving up")
+                    break
+                to_dt = from_dt
+                _time.sleep(1)  # wait before retry on empty
                 continue
 
             consecutive_empty = 0
