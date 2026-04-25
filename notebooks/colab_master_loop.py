@@ -112,6 +112,7 @@ from google.colab import userdata
 
 # Required secrets: OANDA_ACCESS_TOKEN, OANDA_ACCOUNT_ID
 # Optional secret:  WEBHOOK_URL (for Discord/Slack notifications)
+_missing_secrets = []
 for secret_name in ["OANDA_ACCESS_TOKEN", "OANDA_ACCOUNT_ID", "WEBHOOK_URL"]:
     try:
         val = userdata.get(secret_name)
@@ -120,11 +121,23 @@ for secret_name in ["OANDA_ACCESS_TOKEN", "OANDA_ACCOUNT_ID", "WEBHOOK_URL"]:
             print(f"✅ Secret loaded: {secret_name}")
         else:
             print(f"⚠️  Secret '{secret_name}' is empty.")
+            if secret_name != "WEBHOOK_URL":
+                _missing_secrets.append(secret_name)
     except userdata.SecretNotFoundError:
         if secret_name == "WEBHOOK_URL":
             print(f"ℹ️  Optional secret '{secret_name}' not set (notifications disabled).")
         else:
-            print(f"❌ REQUIRED secret '{secret_name}' not found! Add it via 🔑 Secrets in the left sidebar.")
+            print(f"❌ REQUIRED secret '{secret_name}' not found!")
+            _missing_secrets.append(secret_name)
+
+if _missing_secrets:
+    raise RuntimeError(
+        f"❌ Cannot start: missing required secrets: {_missing_secrets}\n"
+        f"   Add them via the 🔑 Secrets panel in the left sidebar.\n\n"
+        f"   OANDA_ACCESS_TOKEN → Your API token from https://www.oanda.com/demo-account/tpa/personal_token\n"
+        f"   OANDA_ACCOUNT_ID   → Your account ID (looks like '101-004-12345678-001')\n"
+        f"                        Find it at: OANDA Dashboard → Manage Funds → top of page"
+    )
 
 # ─────────────────────────────────────────────
 # CELL 2: Initialize Components
@@ -156,7 +169,26 @@ state = StateManager()
 fetcher = OandaFetcher()
 scanner = SentimentScanner()
 executor = OandaExecutor()
-risk_mgr = RiskManager(initial_balance=fetcher.get_account_balance() or 10000.0)
+
+# ─────────────────────────────────────────────
+# Pre-flight: verify OANDA credentials work
+# ─────────────────────────────────────────────
+print("\n🔍 Verifying OANDA credentials...")
+_balance = fetcher.get_account_balance()
+if _balance is None or _balance <= 0:
+    raise RuntimeError(
+        "❌ OANDA authentication FAILED. The bot will NOT start.\n\n"
+        "   Check your Colab Secrets (🔑 left sidebar):\n"
+        f"   OANDA_ACCOUNT_ID   = '{os.environ.get('OANDA_ACCOUNT_ID', '')}'\n"
+        f"   OANDA_ACCESS_TOKEN = '{os.environ.get('OANDA_ACCESS_TOKEN', '')[:8]}...'\n\n"
+        "   Common fixes:\n"
+        "   1. Account ID format should be like '101-004-12345678-001' (not a word)\n"
+        "   2. Token must be from the SAME account type (Practice vs Live)\n"
+        "   3. Generate a new token at: https://www.oanda.com/demo-account/tpa/personal_token"
+    )
+print(f"✅ OANDA connected! Account balance: ${_balance:,.2f}")
+
+risk_mgr = RiskManager(initial_balance=_balance)
 journal = TradeJournal(state)
 
 # Per-instrument models
