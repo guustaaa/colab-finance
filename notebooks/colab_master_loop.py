@@ -67,26 +67,24 @@ REPO_URL = "https://github.com/guustaaa/colab-finance.git"
 REPO_DIR = "/content/colab-finance"
 
 def sync_repo():
-    """Self-healing repo sync: always ends with a clean, up-to-date clone."""
-    # Reset CWD — a previous run may have chdir'd into the repo dir we're about to delete
+    """Always leaves the repo at the exact latest commit on origin/main."""
     os.chdir("/content")
+
     if os.path.isdir(os.path.join(REPO_DIR, ".git")):
-        # Directory exists with a valid .git — try to pull latest
+        # Force-sync: fetch then hard-reset (handles dirty state, conflicts, etc.)
+        subprocess.run(["git", "-C", REPO_DIR, "fetch", "origin"], capture_output=True)
         result = subprocess.run(
-            ["git", "-C", REPO_DIR, "pull", "--ff-only"],
+            ["git", "-C", REPO_DIR, "reset", "--hard", "origin/main"],
             capture_output=True, text=True
         )
         if result.returncode == 0:
-            print("✅ Repository updated (git pull).")
+            print("✅ Repository updated (git reset --hard origin/main).")
             return
-        # Pull failed (dirty state, merge conflict, etc.) — nuke and re-clone
-        print(f"⚠️  Pull failed ({result.stderr.strip()}). Re-cloning fresh...")
+        print(f"⚠️  Reset failed ({result.stderr.strip()}). Re-cloning...")
 
-    # Remove any leftover directory (corrupted clone, partial download, etc.)
     if os.path.exists(REPO_DIR):
         shutil.rmtree(REPO_DIR)
 
-    # Fresh clone
     result = subprocess.run(
         ["git", "clone", REPO_URL, REPO_DIR],
         capture_output=True, text=True
