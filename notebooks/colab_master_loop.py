@@ -62,15 +62,54 @@ for subdir in ["models", "logs", "data"]:
 print(f"✅ State directory ready: {STATE_DIR}")
 
 # Clone or pull the repository
-REPO_URL = "https://github.com/guustaaa/colab-finance.git"
-REPO_DIR = "/content/colab-finance"
+import subprocess, getpass
+
+GITHUB_USER = "guustaaa"
+REPO_NAME = "colab-finance"
+REPO_DIR = f"/content/{REPO_NAME}"
+
+def clone_repo():
+    """Clone the repo, prompting for a GitHub PAT if it's private."""
+    # First try public clone
+    public_url = f"https://github.com/{GITHUB_USER}/{REPO_NAME}.git"
+    result = subprocess.run(
+        ["git", "clone", public_url, REPO_DIR],
+        capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        print("✅ Repository cloned (public).")
+        return True
+
+    # Public clone failed — repo is probably private. Ask for a PAT.
+    print("⚠️  Public clone failed (repo is likely private).")
+    print("   Generate a token at: https://github.com/settings/tokens")
+    print("   Required scope: 'repo' (Full control of private repositories)")
+    token = getpass.getpass("Enter your GitHub Personal Access Token: ")
+
+    auth_url = f"https://{token}@github.com/{GITHUB_USER}/{REPO_NAME}.git"
+    result = subprocess.run(
+        ["git", "clone", auth_url, REPO_DIR],
+        capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        print("✅ Repository cloned (authenticated).")
+        return True
+    else:
+        print(f"❌ Clone failed: {result.stderr.strip()}")
+        return False
 
 if os.path.exists(REPO_DIR):
-    os.system(f"cd {REPO_DIR} && git pull")
+    subprocess.run(["git", "-C", REPO_DIR, "pull"], capture_output=True)
     print("✅ Repository updated.")
 else:
-    os.system(f"git clone {REPO_URL} {REPO_DIR}")
-    print("✅ Repository cloned.")
+    if not clone_repo():
+        raise RuntimeError(
+            "Could not clone the repository. Check your token and repo URL."
+        )
+
+# Verify the directory actually exists before proceeding
+if not os.path.isdir(REPO_DIR):
+    raise FileNotFoundError(f"Repository directory not found: {REPO_DIR}")
 
 os.chdir(REPO_DIR)
 os.system("pip install -r requirements.txt -q")
