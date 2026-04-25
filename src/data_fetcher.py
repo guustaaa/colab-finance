@@ -101,25 +101,32 @@ class CapitalClient:
             "Content-Type": "application/json",
         }
 
-    def _get(self, path: str, params: dict = None) -> dict | None:
-        """Authenticated GET request with auto-session refresh."""
+    def _get(self, path: str, params: dict = None, _retries: int = 5) -> dict | None:
+        """Authenticated GET with auto-session refresh and 429 backoff."""
         if not self._ensure_session():
             return None
-        try:
-            resp = requests.get(
-                f"{self.base_url}{path}",
-                headers=self._auth_headers(),
-                params=params,
-                timeout=15,
-            )
-            if resp.status_code == 200:
-                return resp.json()
-            else:
+        for attempt in range(_retries):
+            try:
+                resp = requests.get(
+                    f"{self.base_url}{path}",
+                    headers=self._auth_headers(),
+                    params=params,
+                    timeout=15,
+                )
+                if resp.status_code == 200:
+                    return resp.json()
+                if resp.status_code == 429:
+                    wait = min(2 ** attempt, 30)  # 1, 2, 4, 8, 16, cap 30
+                    logger.warning(f"429 rate-limited on {path} — backoff {wait}s (attempt {attempt+1}/{_retries})")
+                    time.sleep(wait)
+                    continue
                 logger.error(f"GET {path} failed [{resp.status_code}]: {resp.text}")
                 return None
-        except Exception as e:
-            logger.error(f"GET {path} error: {e}")
-            return None
+            except Exception as e:
+                logger.error(f"GET {path} error: {e}")
+                return None
+        logger.error(f"GET {path} exhausted {_retries} retries (429)")
+        return None
 
     def _post(self, path: str, data: dict) -> dict | None:
         """Authenticated POST request."""
@@ -360,7 +367,7 @@ class CapitalFetcher:
                 logger.info(f"[{instrument}] Target reached ({total_so_far} >= {target_candles}). Done.")
                 break
 
-            _time.sleep(0.15)  # respect 10 req/s rate limit
+            _time.sleep(0.3)  # respect 10 req/s rate limit with margin
 
         if not all_frames:
             logger.error(f"[{instrument}] No data fetched at all!")

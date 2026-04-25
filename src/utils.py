@@ -13,6 +13,10 @@ def setup_logger(name: str, log_dir: str = None) -> logging.Logger:
     logger = logging.getLogger(name)
     logger.setLevel(logging.INFO)
 
+    # Prevent duplicate handlers on Colab cell re-runs
+    if logger.handlers:
+        return logger
+
     # Console handler
     ch = logging.StreamHandler()
     ch.setLevel(logging.INFO)

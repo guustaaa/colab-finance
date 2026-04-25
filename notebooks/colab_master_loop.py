@@ -263,7 +263,7 @@ for _inst in INSTRUMENTS:
         print(f"  {_icon} {_inst}: {len(_df):,} candles ({_tag})")
     else:
         print(f"  ❌ {_inst}: no usable data")
-    time.sleep(0.5)  # courtesy pause between pairs
+    time.sleep(2)  # 2s pause between pairs to fully reset rate limit
 
 print(f"\n📥 Data fetch done in {time.time() - _t0:.0f}s")
 notifier.send(f"📥 Bulk data loaded: {len(raw_data)}/{len(INSTRUMENTS)} pairs ready", "info")
