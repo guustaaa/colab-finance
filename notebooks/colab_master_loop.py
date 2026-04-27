@@ -155,6 +155,7 @@ from src.config import (
     MAX_RUNTIME_HOURS, POLL_INTERVAL_SECONDS, WEBHOOK_URL,
     HMM_RETRAIN_INTERVAL, BULK_HISTORY_YEARS,
     DRIVE_DATA_DIR, DRIVE_MODELS_DIR, COMPUTE_DEVICE,
+    MACRO_ASSETS,
 )
 from src.data_fetcher import CapitalFetcher
 from src.features import compute_all_features
@@ -264,7 +265,7 @@ _t0 = time.time()
 raw_data = {}      # H1 data for live trading
 raw_data_m5 = {}   # M5 data for deeper training
 
-for _inst in INSTRUMENTS:
+for _inst in INSTRUMENTS + MACRO_ASSETS:
     # Fetch H1 (main granularity for live loop)
     _cache_h1 = os.path.join(DRIVE_DATA_DIR, f"{_inst}_H1.parquet")
     _df_h1 = fetcher.fetch_bulk_history(
@@ -303,7 +304,7 @@ print("   Models are saved to Drive every 5 minutes.\n")
 _train_start = time.time()
 _checkpoint_interval = 300  # 5 minutes
 
-def _train_one_instrument(inst, df, sentiment_score, all_raw_data):
+def _train_one_instrument(inst, df, articles, all_raw_data):
     """
     Full training pipeline for one instrument.
     Returns (inst, ens, metrics) or (inst, None, error_msg) on failure.
@@ -311,11 +312,16 @@ def _train_one_instrument(inst, df, sentiment_score, all_raw_data):
     from src.features import compute_all_features
     from src.regime import RegimeDetector
     from src.ensemble import EnsembleEngine
+    from src.sentiment import SentimentScanner
 
     try:
         # Build cross-pair data (all pairs except this one)
         cross_pair_data = {k: v for k, v in all_raw_data.items() if k != inst}
         other_pairs = [k for k in all_raw_data if k != inst]
+
+        # Calculate pair-specific sentiment
+        scanner = SentimentScanner()
+        sentiment_score = scanner.get_pair_sentiment(inst, articles)
 
         # Feature engineering with cross-pair correlations
         features = compute_all_features(df, sentiment=sentiment_score, cross_pair_data=cross_pair_data)
@@ -343,8 +349,8 @@ def _train_one_instrument(inst, df, sentiment_score, all_raw_data):
         import traceback
         return inst, None, traceback.format_exc()
 
-# Get current sentiment once (shared across pairs)
-_sentiment = scanner.get_composite_score()
+# Get current sentiment articles once (shared across pairs)
+_articles = scanner.scan_all_feeds()
 
 # Train all pairs in parallel — ProcessPoolExecutor would be faster but
 # scikit-learn/xgboost already use n_jobs=-1 internally, so threads suffice
@@ -353,7 +359,7 @@ _train_errors  = {}
 
 with concurrent.futures.ThreadPoolExecutor(max_workers=len(INSTRUMENTS)) as ex:
     _futures = {
-        ex.submit(_train_one_instrument, inst, raw_data[inst], _sentiment, raw_data): inst
+        ex.submit(_train_one_instrument, inst, raw_data[inst], _articles, raw_data): inst
         for inst in raw_data
     }
 
@@ -467,12 +473,12 @@ def live_trading_loop():
                 notifier.send("🚨 Trading HALTED — max drawdown breached!", "error")
                 break
 
-            # Sentiment is cheap — get it once per cycle
-            sentiment = scanner.get_composite_score()
+            # Fetch sentiment articles once per cycle
+            articles = scanner.scan_all_feeds()
 
             # Fetch all pairs' candles once per cycle (for cross-pair features)
             _cycle_data = {}
-            for _ci in INSTRUMENTS:
+            for _ci in INSTRUMENTS + MACRO_ASSETS:
                 _cdf = fetcher.fetch_candles(_ci, count=300, granularity=TRADING_GRANULARITY)
                 if _cdf is not None and len(_cdf) >= 200:
                     _cycle_data[_ci] = _cdf
@@ -489,6 +495,10 @@ def live_trading_loop():
 
                     # Cross-pair data for correlation features
                     cross_data = {k: v for k, v in _cycle_data.items() if k != inst}
+                    
+                    # Pair-specific sentiment
+                    sentiment = scanner.get_pair_sentiment(inst, articles)
+                    
                     features = compute_all_features(df, sentiment=sentiment, cross_pair_data=cross_data)
                     if features.empty:
                         continue

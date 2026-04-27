@@ -230,6 +230,18 @@ SENTIMENT_KEYWORDS = [
     "recession", "default", "banking crisis",
 ]
 
+# Specifically map which keywords affect which currency
+CURRENCY_NEWS_KEYWORDS = {
+    "USD": ["usd", "dollar", "fed", "powell", "fomc", "nfp", "trump", "biden", "yellen", "treasury"],
+    "EUR": ["eur", "euro", "ecb", "lagarde", "germany", "bundesbank", "eu"],
+    "GBP": ["gbp", "pound", "boe", "bailey", "uk", "britain"],
+    "JPY": ["jpy", "yen", "boj", "ueda", "kuroda", "japan", "tokyo"],
+    "AUD": ["aud", "aussie", "rba", "bullock", "australia", "iron ore"],
+    "CAD": ["cad", "loonie", "boc", "macklem", "canada", "oil"],
+    "NZD": ["nzd", "kiwi", "rbnz", "orr", "new zealand", "dairy"],
+    "CHF": ["chf", "franc", "snb", "jordan", "swiss", "switzerland"],
+}
+
 RSS_FEEDS = [
     "https://feeds.finance.yahoo.com/rss/2.0/headline?s=EURUSD=X",
     "https://www.forexlive.com/feed/news",
@@ -254,4 +266,22 @@ POLL_INTERVAL_SECONDS = 300  # 5 minutes between live checks (match H1 candle bu
 DRIVE_STATE_DIR = "/content/drive/MyDrive/ForexAI_State"
 DRIVE_MODELS_DIR = f"{DRIVE_STATE_DIR}/models"
 DRIVE_LOGS_DIR = f"{DRIVE_STATE_DIR}/logs"
-DRIVE_DATA_DIR = f"{DRIVE_STATE_DIR}/data"
+
+# Use local Colab storage for data to prevent Drive I/O stalling (Drive is too slow for 200MB+ parquets)
+# /content is the local SSD on Colab
+import os as _os
+if _os.path.exists("/content") and not _os.path.exists("C:\\"):
+    DRIVE_DATA_DIR = "/content/ForexAI_Data"
+else:
+    DRIVE_DATA_DIR = "./data"
+
+# ─────────────────────────────────────────────
+# MACRO COVARIATES
+# ─────────────────────────────────────────────
+# These external assets are fetched to provide cross-market context to the AI
+MACRO_ASSETS = [
+    "US500",      # S&P 500 (Risk Sentiment)
+    "US100",      # Nasdaq 100 (Tech/Growth Risk)
+    "GOLD",       # Gold (Safe haven / Inflation)
+    "OIL_CRUDE",  # WTI Crude (Commodity driver for CAD/AUD)
+]

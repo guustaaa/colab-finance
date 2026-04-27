@@ -15,7 +15,7 @@ import logging
 from datetime import datetime
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
-from src.config import SENTIMENT_KEYWORDS, RSS_FEEDS
+from src.config import SENTIMENT_KEYWORDS, RSS_FEEDS, CURRENCY_NEWS_KEYWORDS
 
 logger = logging.getLogger("sentiment")
 
@@ -23,44 +23,43 @@ logger = logging.getLogger("sentiment")
 class SentimentScanner:
     """
     Scans free financial RSS feeds for market-relevant news and
-    computes a composite sentiment score.
+    computes sentiment scores tailored to specific currencies.
     """
 
-    def __init__(self, keywords: list = None, feeds: list = None):
+    def __init__(self, feeds: list = None):
         self.analyzer = SentimentIntensityAnalyzer()
-        self.keywords = keywords or SENTIMENT_KEYWORDS
         self.feeds = feeds or RSS_FEEDS
+        self.currency_keywords = CURRENCY_NEWS_KEYWORDS
 
     def scan_all_feeds(self) -> list:
         """
         Fetch all RSS feeds and extract relevant, scored headlines.
-
-        Returns list of dicts with: title, source, compound_score, keywords_found
         """
         results = []
         for feed_url in self.feeds:
             try:
                 feed = feedparser.parse(feed_url)
-                for entry in feed.entries[:20]:  # Cap at 20 per feed to avoid slowdown
+                for entry in feed.entries[:20]:  # Cap at 20 per feed
                     title = entry.get("title", "")
                     summary = entry.get("summary", "")
                     text = f"{title} {summary}".lower()
 
-                    # Only score if relevant keywords are present
-                    matched = [kw for kw in self.keywords if kw in text]
-                    if not matched:
+                    # Find which currencies this text is talking about
+                    mentioned_currencies = []
+                    for cur, kws in self.currency_keywords.items():
+                        if any(kw in text for kw in kws):
+                            mentioned_currencies.append(cur)
+
+                    if not mentioned_currencies:
                         continue
 
                     score = self.analyzer.polarity_scores(title)
 
                     results.append({
                         "title": title,
-                        "source": feed_url.split("/")[2],  # domain name
+                        "source": feed_url.split("/")[2],
                         "compound": score["compound"],
-                        "pos": score["pos"],
-                        "neg": score["neg"],
-                        "keywords": matched,
-                        "scanned_at": datetime.now().isoformat(),
+                        "currencies": mentioned_currencies,
                     })
             except Exception as e:
                 logger.warning(f"RSS feed error ({feed_url}): {e}")
@@ -68,45 +67,45 @@ class SentimentScanner:
         logger.info(f"Sentiment scan complete: {len(results)} relevant articles found")
         return results
 
-    def get_composite_score(self) -> float:
-        """
-        Get a single composite sentiment score for the market.
-
-        Returns a value between -1 (extremely bearish) and +1 (extremely bullish).
-        Returns 0 if no relevant news found (neutral assumption).
-
-        The composite is a weighted average where more extreme scores
-        carry more weight (to capture strong sentiment signals).
-        """
-        articles = self.scan_all_feeds()
-        if not articles:
+    def get_currency_sentiment(self, currency: str, articles: list) -> float:
+        """Calculate the weighted sentiment score specifically for one currency."""
+        relevant = [a for a in articles if currency in a["currencies"]]
+        if not relevant:
             return 0.0
 
-        # Weighted by absolute compound score (extreme sentiment = more important)
-        scores = [a["compound"] for a in articles]
-        weights = [abs(s) + 0.01 for s in scores]  # +0.01 to avoid zero weights
+        scores = [a["compound"] for a in relevant]
+        weights = [abs(s) + 0.01 for s in scores]
 
         weighted_sum = sum(s * w for s, w in zip(scores, weights))
         total_weight = sum(weights)
+        return weighted_sum / total_weight if total_weight > 0 else 0.0
 
-        composite = weighted_sum / total_weight if total_weight > 0 else 0.0
+    def get_pair_sentiment(self, instrument: str, articles: list = None) -> float:
+        """
+        Get the sentiment diff for a specific FX pair.
+        E.g., EUR_USD -> Sentiment(EUR) - Sentiment(USD)
+        Returns a value between -2 (bearish base, bullish quote) and +2.
+        """
+        if articles is None:
+            articles = self.scan_all_feeds()
+            
+        if not articles or "_" not in instrument:
+            return 0.0
 
-        logger.info(f"Composite sentiment: {composite:.4f} (from {len(articles)} articles)")
-        return composite
+        base, quote = instrument.split("_")
+        base_sent = self.get_currency_sentiment(base, articles)
+        quote_sent = self.get_currency_sentiment(quote, articles)
 
-    def get_detailed_report(self) -> dict:
-        """Get a detailed sentiment breakdown for logging/notification."""
+        # If base is good and quote is bad, pair goes UP
+        pair_diff = base_sent - quote_sent
+        logger.debug(f"[{instrument}] Sentiment -> Base({base}): {base_sent:.2f} | Quote({quote}): {quote_sent:.2f} | Diff: {pair_diff:.2f}")
+        
+        return pair_diff
+
+    def get_composite_score(self) -> float:
+        """Legacy global score (kept for backwards compatibility if needed)."""
         articles = self.scan_all_feeds()
         if not articles:
-            return {"composite": 0.0, "article_count": 0, "top_bullish": [], "top_bearish": []}
-
+            return 0.0
         scores = [a["compound"] for a in articles]
-        sorted_articles = sorted(articles, key=lambda x: x["compound"])
-
-        return {
-            "composite": self.get_composite_score(),
-            "article_count": len(articles),
-            "avg_score": sum(scores) / len(scores),
-            "top_bullish": [a["title"] for a in sorted_articles[-3:]],
-            "top_bearish": [a["title"] for a in sorted_articles[:3]],
-        }
+        return sum(scores) / len(scores)
