@@ -298,10 +298,10 @@ class CapitalFetcher:
                 cached = pd.read_parquet(cache_path)
                 if not cached.empty and len(cached) >= 200:
                     age_hours = (pd.Timestamp.now(tz="UTC") - cached.index[-1]).total_seconds() / 3600
-                    if age_hours < 24:
+                    if age_hours < 168:  # 1 week
                         logger.info(f"[{instrument}] Loaded {len(cached)} candles from cache (age {age_hours:.1f}h)")
                         return cached
-                    logger.info(f"[{instrument}] Cache stale ({age_hours:.0f}h old). Refreshing...")
+                    logger.info(f"[{instrument}] Cache stale ({age_hours:.0f}h > 168h). Refreshing massive dataset...")
                 elif not cached.empty:
                     logger.warning(f"[{instrument}] Cache too small ({len(cached)} candles). Re-fetching.")
             except Exception as e:
@@ -371,8 +371,6 @@ class CapitalFetcher:
             if total_so_far >= target_candles:
                 logger.info(f"[{instrument}] Target reached ({total_so_far} >= {target_candles}). Done.")
                 break
-
-            _time.sleep(0.3)  # respect 10 req/s rate limit with margin
 
         if not all_frames:
             logger.error(f"[{instrument}] No data fetched at all!")
