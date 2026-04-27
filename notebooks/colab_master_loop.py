@@ -266,33 +266,39 @@ _t0 = time.time()
 raw_data = {}      # H1 data for live trading
 raw_data_m5 = {}   # M5 data for deeper training
 
-for _inst in INSTRUMENTS + MACRO_ASSETS:
-    # Fetch H1 (main granularity for live loop)
-    _cache_h1 = os.path.join(DRIVE_DATA_DIR, f"{_inst}_H1.parquet")
+def _fetch_for_inst(inst):
+    _cache_h1 = os.path.join(DRIVE_DATA_DIR, f"{inst}_H1.parquet")
     _df_h1 = fetcher.fetch_bulk_history(
-        instrument=_inst, years=BULK_HISTORY_YEARS,
+        instrument=inst, years=BULK_HISTORY_YEARS,
         granularity="H1", cache_path=_cache_h1,
     )
-
-    # Fetch M5 (12x more data points from same time window)
-    _cache_m5 = os.path.join(DRIVE_DATA_DIR, f"{_inst}_M5.parquet")
+    _cache_m5 = os.path.join(DRIVE_DATA_DIR, f"{inst}_M5.parquet")
     _df_m5 = fetcher.fetch_bulk_history(
-        instrument=_inst, years=BULK_HISTORY_YEARS,
+        instrument=inst, years=BULK_HISTORY_YEARS,
         granularity="M5", cache_path=_cache_m5,
     )
+    return inst, _df_h1, _df_m5
 
-    if _df_h1 is not None and len(_df_h1) >= 200:
-        raw_data[_inst] = _df_h1
-    if _df_m5 is not None and len(_df_m5) >= 200:
-        raw_data_m5[_inst] = _df_m5
+print("\n📥 Fetching max available history per pair (H1 + M5 for depth) in PARALLEL...")
+_t0 = time.time()
 
-    _h1_n = len(_df_h1) if _df_h1 is not None else 0
-    _m5_n = len(_df_m5) if _df_m5 is not None else 0
-    if _h1_n >= 200:
-        _tag = f"{_df_h1.index[0].date()} → {_df_h1.index[-1].date()}"
-        print(f"  ✅ {_inst}: {_h1_n:,} H1 + {_m5_n:,} M5 candles ({_tag})")
-    else:
-        print(f"  ❌ {_inst}: insufficient data (H1={_h1_n}, M5={_m5_n})")
+with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(INSTRUMENTS + MACRO_ASSETS), 12)) as ex:
+    _futures = {ex.submit(_fetch_for_inst, inst): inst for inst in INSTRUMENTS + MACRO_ASSETS}
+    for fut in concurrent.futures.as_completed(_futures):
+        _inst, _df_h1, _df_m5 = fut.result()
+        
+        if _df_h1 is not None and len(_df_h1) >= 200:
+            raw_data[_inst] = _df_h1
+        if _df_m5 is not None and len(_df_m5) >= 200:
+            raw_data_m5[_inst] = _df_m5
+
+        _h1_n = len(_df_h1) if _df_h1 is not None else 0
+        _m5_n = len(_df_m5) if _df_m5 is not None else 0
+        if _h1_n >= 200:
+            _tag = f"{_df_h1.index[0].date()} → {_df_h1.index[-1].date()}"
+            print(f"  ✅ {_inst}: {_h1_n:,} H1 + {_m5_n:,} M5 candles ({_tag})")
+        else:
+            print(f"  ❌ {_inst}: insufficient data (H1={_h1_n}, M5={_m5_n})")
     time.sleep(2)
 
 print(f"\n📥 Data fetch done in {time.time() - _t0:.0f}s | H1: {len(raw_data)} pairs | M5: {len(raw_data_m5)} pairs")
