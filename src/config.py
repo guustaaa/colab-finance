@@ -263,17 +263,26 @@ POLL_INTERVAL_SECONDS = 300  # 5 minutes between live checks (match H1 candle bu
 # ─────────────────────────────────────────────
 # GOOGLE DRIVE STATE PATHS (when running in Colab)
 # ─────────────────────────────────────────────
-DRIVE_STATE_DIR = "/content/drive/MyDrive/ForexAI_State"
-DRIVE_MODELS_DIR = f"{DRIVE_STATE_DIR}/models"
-DRIVE_LOGS_DIR = f"{DRIVE_STATE_DIR}/logs"
-
-# Use local Colab storage for data to prevent Drive I/O stalling (Drive is too slow for 200MB+ parquets)
-# /content is the local SSD on Colab
 import os as _os
-if _os.path.exists("/content") and not _os.path.exists("C:\\"):
+if _os.path.exists("/kaggle/working"):
+    # Kaggle environment
+    DRIVE_STATE_DIR = "/kaggle/working/ForexAI_State"
+    DRIVE_DATA_DIR = "/kaggle/working/ForexAI_Data"
+elif _os.path.exists("/content/drive/MyDrive"):
+    # Colab environment WITH drive mounted
+    DRIVE_STATE_DIR = "/content/drive/MyDrive/ForexAI_State"
+    DRIVE_DATA_DIR = "/content/ForexAI_Data"
+elif _os.path.exists("/content"):
+    # Colab environment WITHOUT drive mounted
+    DRIVE_STATE_DIR = "/content/ForexAI_State"
     DRIVE_DATA_DIR = "/content/ForexAI_Data"
 else:
+    # Local PC environment
+    DRIVE_STATE_DIR = "./state"
     DRIVE_DATA_DIR = "./data"
+
+DRIVE_MODELS_DIR = f"{DRIVE_STATE_DIR}/models"
+DRIVE_LOGS_DIR = f"{DRIVE_STATE_DIR}/logs"
 
 # ─────────────────────────────────────────────
 # MACRO COVARIATES

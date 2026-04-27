@@ -100,7 +100,13 @@ class RegimeDetector:
                     random_state=42,
                     tol=0.01,
                 )
-                self.model.fit(obs)
+                import warnings
+                from hmmlearn.base import ConvergenceWarning
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", ConvergenceWarning)
+                    warnings.filterwarnings("ignore", message=".*'covars' must be symmetric.*")
+                    self.model.fit(obs)
+                
                 self._label_states(obs)
 
                 if model_path:
