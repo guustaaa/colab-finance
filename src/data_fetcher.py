@@ -325,16 +325,15 @@ class CapitalFetcher:
         logger.info(f"[{instrument}] Fetching {target_candles} candles ({years:.1f}y) in {max_batches} batches...")
 
         for batch_num in range(max_batches):
-            # Walk backwards by batch_size candles worth of time
+            # Step back by batch size if we hit an empty spot and need to retry
             hours_per_batch = batch_size / candles_per_day
-            from_dt = to_dt - pd.Timedelta(hours=hours_per_batch * 1.05)  # slight overlap
+            fallback_to_dt = to_dt - pd.Timedelta(hours=hours_per_batch * 1.05)
 
             data = self.client._get(
                 f"/api/v1/prices/{epic}",
                 params={
                     "resolution": resolution,
                     "max": batch_size,
-                    "from": from_dt.strftime("%Y-%m-%dT%H:%M:%S"),
                     "to":   to_dt.strftime("%Y-%m-%dT%H:%M:%S"),
                 },
             )
@@ -348,7 +347,7 @@ class CapitalFetcher:
                 if consecutive_empty >= 3:
                     logger.warning(f"[{instrument}] 3 empty batches with no data at all — giving up")
                     break
-                to_dt = from_dt
+                to_dt = fallback_to_dt
                 _time.sleep(1)  # wait before retry on empty
                 continue
 

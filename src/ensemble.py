@@ -7,6 +7,7 @@ Architecture:
   Layer 3: Deep Neural Net stacker (learns optimal combination)
   Context: HMM regime weighting
 """
+import warnings
 import numpy as np
 import pandas as pd
 import xgboost as xgb
@@ -15,6 +16,9 @@ import joblib
 import logging
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
+
+# Suppress sklearn feature name warnings (we handle this correctly)
+warnings.filterwarnings("ignore", message="X does not have valid feature names")
 
 from src.features import get_feature_columns
 from src.config import XGB_PARAMS, LGB_PARAMS, WALK_FORWARD_TRAIN_SIZE, WALK_FORWARD_TEST_SIZE
@@ -222,8 +226,8 @@ class XGBoostPredictor:
         )
 
         # ── Train DNN stacker on tree outputs + raw features ──
-        xgb_probs = self.model.predict_proba(X.values)[:, 1]
-        lgb_probs = self.lgb_model.predict_proba(X.values)[:, 1]
+        xgb_probs = self.model.predict_proba(X)[:, 1]
+        lgb_probs = self.lgb_model.predict_proba(X)[:, 1]
         stacker_X = np.column_stack([X.values, xgb_probs, lgb_probs])
         self.dnn.train(stacker_X, y.values, epochs=200)
 
@@ -261,13 +265,13 @@ class XGBoostPredictor:
         X_latest = X.iloc[[-1]]
 
         # XGBoost probability
-        xgb_prob = self.model.predict_proba(X_latest.values)[0]
+        xgb_prob = self.model.predict_proba(X_latest)[0]
         xgb_up = xgb_prob[1] if len(xgb_prob) > 1 else xgb_prob[0]
 
         # LightGBM probability
         lgb_up = xgb_up
         if self.lgb_model is not None:
-            lgb_prob = self.lgb_model.predict_proba(X_latest.values)[0]
+            lgb_prob = self.lgb_model.predict_proba(X_latest)[0]
             lgb_up = lgb_prob[1] if len(lgb_prob) > 1 else lgb_prob[0]
 
         # DNN stacker probability

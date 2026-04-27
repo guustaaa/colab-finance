@@ -247,41 +247,54 @@ elif COMPUTE_DEVICE == "gpu":
 else:
     print("   ℹ️  CPU mode — all cores active via n_jobs=-1.")
 
-# ── STEP 1: Bulk data fetch ──
-# Nuke truly poisoned caches (< 100 candles = from 429 failures)
+# ── STEP 1: Bulk data fetch (H1 + M5 for deeper training) ──
 import glob as _glob
-for _pq in _glob.glob(os.path.join(DRIVE_DATA_DIR, "*_H1_2y.parquet")):
+for _pq in _glob.glob(os.path.join(DRIVE_DATA_DIR, "*.parquet")):
     try:
         _tmp = pd.read_parquet(_pq)
         if len(_tmp) < 100:
             os.remove(_pq)
-            print(f"  🗑️  Deleted poisoned cache: {os.path.basename(_pq)} ({len(_tmp)} candles)")
+            print(f"  🗑️  Deleted bad cache: {os.path.basename(_pq)} ({len(_tmp)} candles)")
     except Exception:
         os.remove(_pq)
 
-print("\n📥 Fetching 2 years of history per pair (sequential, cached to Drive)...")
+print("\n📥 Fetching max available history per pair (H1 + M5 for depth)...")
 _t0 = time.time()
 
-raw_data = {}
-for _inst in INSTRUMENTS:
-    _cache = os.path.join(DRIVE_DATA_DIR, f"{_inst}_H1_2y.parquet")
-    _df = fetcher.fetch_bulk_history(
-        instrument=_inst,
-        years=BULK_HISTORY_YEARS,
-        granularity=TRADING_GRANULARITY,
-        cache_path=_cache,
-    )
-    if _df is not None and len(_df) >= 200:
-        raw_data[_inst] = _df
-        _tag = f"{_df.index[0].date()} → {_df.index[-1].date()}"
-        _icon = "✅" if len(_df) >= 500 else "⚠️ "
-        print(f"  {_icon} {_inst}: {len(_df):,} candles ({_tag})")
-    else:
-        print(f"  ❌ {_inst}: no usable data")
-    time.sleep(2)  # 2s pause between pairs to fully reset rate limit
+raw_data = {}      # H1 data for live trading
+raw_data_m5 = {}   # M5 data for deeper training
 
-print(f"\n📥 Data fetch done in {time.time() - _t0:.0f}s")
-notifier.send(f"📥 Bulk data loaded: {len(raw_data)}/{len(INSTRUMENTS)} pairs ready", "info")
+for _inst in INSTRUMENTS:
+    # Fetch H1 (main granularity for live loop)
+    _cache_h1 = os.path.join(DRIVE_DATA_DIR, f"{_inst}_H1.parquet")
+    _df_h1 = fetcher.fetch_bulk_history(
+        instrument=_inst, years=BULK_HISTORY_YEARS,
+        granularity="H1", cache_path=_cache_h1,
+    )
+
+    # Fetch M5 (12x more data points from same time window)
+    _cache_m5 = os.path.join(DRIVE_DATA_DIR, f"{_inst}_M5.parquet")
+    _df_m5 = fetcher.fetch_bulk_history(
+        instrument=_inst, years=BULK_HISTORY_YEARS,
+        granularity="M5", cache_path=_cache_m5,
+    )
+
+    if _df_h1 is not None and len(_df_h1) >= 200:
+        raw_data[_inst] = _df_h1
+    if _df_m5 is not None and len(_df_m5) >= 200:
+        raw_data_m5[_inst] = _df_m5
+
+    _h1_n = len(_df_h1) if _df_h1 is not None else 0
+    _m5_n = len(_df_m5) if _df_m5 is not None else 0
+    if _h1_n >= 200:
+        _tag = f"{_df_h1.index[0].date()} → {_df_h1.index[-1].date()}"
+        print(f"  ✅ {_inst}: {_h1_n:,} H1 + {_m5_n:,} M5 candles ({_tag})")
+    else:
+        print(f"  ❌ {_inst}: insufficient data (H1={_h1_n}, M5={_m5_n})")
+    time.sleep(2)
+
+print(f"\n📥 Data fetch done in {time.time() - _t0:.0f}s | H1: {len(raw_data)} pairs | M5: {len(raw_data_m5)} pairs")
+notifier.send(f"📥 Data loaded: {len(raw_data)} H1 + {len(raw_data_m5)} M5 pairs", "info")
 
 # ── STEP 2: Parallel training with Drive checkpointing ──
 print("\n🧠 Starting parallel training (this will saturate all CPU cores)...")

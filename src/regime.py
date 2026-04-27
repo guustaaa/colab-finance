@@ -19,11 +19,15 @@ Key design decisions:
     without overfitting (>4 states rarely improves FX regime detection)
   - Walk-forward retraining to handle structural breaks
 """
+import warnings
 import numpy as np
 import pandas as pd
 import joblib
 import logging
 from hmmlearn.hmm import GaussianHMM
+
+# Suppress HMM convergence warnings (expected with limited data)
+warnings.filterwarnings("ignore", module="hmmlearn")
 
 from src.config import HMM_N_STATES, HMM_LOOKBACK
 
@@ -83,8 +87,8 @@ class RegimeDetector:
             logger.warning(f"Insufficient data for HMM fitting: {len(obs)} observations")
             return False
 
-        # Add tiny noise regularization to prevent singular covariance on smooth data
-        obs = obs + np.random.normal(0, 1e-8, obs.shape)
+        # Add noise regularization to prevent singular covariance
+        obs = obs + np.random.normal(0, 1e-6, obs.shape)
 
         # Try covariance types in order of expressiveness, falling back if singular
         for cov_type in ["full", "diag", "spherical"]:
