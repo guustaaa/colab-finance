@@ -49,26 +49,43 @@ import os
 import sys
 import time
 from datetime import datetime, timedelta
+import subprocess, shutil
 
-# Mount Google Drive for persistent state
-from google.colab import drive
-drive.mount('/content/drive')
-print("✅ Google Drive mounted.")
+# Detect Environment
+IS_KAGGLE = os.path.exists("/kaggle/working")
+IS_COLAB = os.path.exists("/var/colab/hostname")
+
+if IS_KAGGLE:
+    print("✅ Kaggle Environment Detected.")
+    ROOT_DIR = "/kaggle/working"
+    STATE_DIR = "/kaggle/working/ForexAI_State"
+elif IS_COLAB:
+    print("✅ Google Colab Environment Detected.")
+    ROOT_DIR = "/content"
+    STATE_DIR = "/content/drive/MyDrive/ForexAI_State"
+    # Mount Google Drive for persistent state
+    try:
+        from google.colab import drive
+        drive.mount('/content/drive')
+        print("✅ Google Drive mounted.")
+    except NotImplementedError:
+        print("⚠️ Could not mount drive (not supported in this mode).")
+else:
+    print("✅ Local Environment Detected.")
+    ROOT_DIR = os.getcwd()
+    STATE_DIR = os.path.join(ROOT_DIR, "ForexAI_State")
 
 # Create state directories
-STATE_DIR = "/content/drive/MyDrive/ForexAI_State"
 for subdir in ["models", "logs", "data"]:
     os.makedirs(os.path.join(STATE_DIR, subdir), exist_ok=True)
 print(f"✅ State directory ready: {STATE_DIR}")
 
-import subprocess, shutil
-
 REPO_URL = "https://github.com/guustaaa/colab-finance.git"
-REPO_DIR = "/content/colab-finance"
+REPO_DIR = os.path.join(ROOT_DIR, "colab-finance")
 
 def sync_repo():
     """Always leaves the repo at the exact latest commit on origin/main."""
-    os.chdir("/content")
+    os.chdir(ROOT_DIR)
 
     if os.path.isdir(os.path.join(REPO_DIR, ".git")):
         # Force-sync: fetch then hard-reset (handles dirty state, conflicts, etc.)
@@ -79,22 +96,18 @@ def sync_repo():
         )
         if result.returncode == 0:
             print("✅ Repository updated (git reset --hard origin/main).")
-            return
-        print(f"⚠️  Reset failed ({result.stderr.strip()}). Re-cloning...")
-
-    if os.path.exists(REPO_DIR):
-        shutil.rmtree(REPO_DIR)
-
-    result = subprocess.run(
-        ["git", "clone", REPO_URL, REPO_DIR],
-        capture_output=True, text=True
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"❌ Git clone failed:\n{result.stderr}\n"
-            f"Make sure the repo is public: {REPO_URL}"
-        )
-    print("✅ Repository cloned.")
+        else:
+            print(f"⚠️ Failed to reset repo: {result.stderr}")
+    else:
+        # First time setup
+        if os.path.exists(REPO_DIR): shutil.rmtree(REPO_DIR)
+        result = subprocess.run(["git", "clone", REPO_URL, REPO_DIR], capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Failed to clone repository.\nError: {result.stderr}\n"
+                f"Make sure the repo is public: {REPO_URL}"
+            )
+        print("✅ Repository cloned.")
 
 sync_repo()
 
@@ -109,24 +122,38 @@ sys.path.insert(0, REPO_DIR)
 print("✅ Dependencies installed.")
 
 # ─────────────────────────────────────────────
-# Load credentials from Colab Secrets (🔑 icon in left sidebar)
+# Load credentials from Colab/Kaggle Secrets
 # ─────────────────────────────────────────────
-from google.colab import userdata
-
-# Required secrets: CAPITAL_API_KEY, CAPITAL_EMAIL, CAPITAL_PASSWORD
-# Optional secret:  WEBHOOK_URL (for Discord/Slack notifications)
 _missing_secrets = []
-for secret_name in ["CAPITAL_API_KEY", "CAPITAL_EMAIL", "CAPITAL_PASSWORD", "WEBHOOK_URL"]:
+secret_keys = ["CAPITAL_API_KEY", "CAPITAL_EMAIL", "CAPITAL_PASSWORD", "WEBHOOK_URL"]
+
+if IS_KAGGLE:
     try:
-        val = userdata.get(secret_name)
-        if val:
-            os.environ[secret_name] = val
-            print(f"✅ Secret loaded: {secret_name}")
-        else:
-            print(f"⚠️  Secret '{secret_name}' is empty.")
-            if secret_name != "WEBHOOK_URL":
-                _missing_secrets.append(secret_name)
-    except userdata.SecretNotFoundError:
+        from kaggle_secrets import UserSecretsClient
+        user_secrets = UserSecretsClient()
+        for secret_name in secret_keys:
+            try:
+                val = user_secrets.get_secret(secret_name)
+                if val:
+                    os.environ[secret_name] = val
+                    print(f"✅ Secret loaded: {secret_name}")
+            except Exception:
+                pass
+    except ImportError:
+        pass
+elif IS_COLAB:
+    from google.colab import userdata
+    for secret_name in secret_keys:
+        try:
+            val = userdata.get(secret_name)
+            if val:
+                os.environ[secret_name] = val
+                print(f"✅ Secret loaded: {secret_name}")
+        except Exception:
+            pass
+
+for secret_name in secret_keys:
+    if not os.environ.get(secret_name):
         if secret_name == "WEBHOOK_URL":
             print(f"ℹ️  Optional secret '{secret_name}' not set (notifications disabled).")
         else:
