@@ -80,6 +80,26 @@ class ForexEnv(gym.Env):
         
         return np.concatenate((window_flat, account_state))
 
+    @staticmethod
+    def get_live_observation(features_df: pd.DataFrame, window_size: int, balance: float, initial_balance: float, position: int, unrealized_pnl: float) -> np.ndarray:
+        """Helper to generate a live observation for the RL Agent's predict() method during live trading."""
+        # Ensure we have enough data
+        if len(features_df) < window_size:
+            # Pad with zeros if we don't have enough history
+            window = np.zeros((window_size, len(features_df.columns)), dtype=np.float32)
+            window[-len(features_df):] = features_df.values
+        else:
+            window = features_df.iloc[-window_size:].values
+            
+        window_flat = window.flatten()
+        account_state = np.array([
+            balance / initial_balance,
+            float(position),
+            unrealized_pnl / initial_balance
+        ], dtype=np.float32)
+        
+        return np.concatenate((window_flat, account_state))
+
     def step(self, action):
         self.current_step += 1
         

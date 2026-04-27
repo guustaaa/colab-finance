@@ -386,7 +386,7 @@ _articles = scanner.scan_all_feeds()
 _train_results = {}
 _train_errors  = {}
 
-with concurrent.futures.ThreadPoolExecutor(max_workers=len(INSTRUMENTS)) as ex:
+with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(INSTRUMENTS), max(1, os.cpu_count() // 2))) as ex:
     _futures = {}
     for i, inst in enumerate(INSTRUMENTS):
         if inst in raw_data:
