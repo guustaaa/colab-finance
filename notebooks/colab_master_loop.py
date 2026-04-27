@@ -272,14 +272,9 @@ def _fetch_for_inst(inst):
         instrument=inst, years=BULK_HISTORY_YEARS,
         granularity="H1", cache_path=_cache_h1,
     )
-    _cache_m5 = os.path.join(DRIVE_DATA_DIR, f"{inst}_M5.parquet")
-    _df_m5 = fetcher.fetch_bulk_history(
-        instrument=inst, years=BULK_HISTORY_YEARS,
-        granularity="M5", cache_path=_cache_m5,
-    )
-    return inst, _df_h1, _df_m5
+    return inst, _df_h1, None
 
-print("\n📥 Fetching max available history per pair (H1 + M5 for depth) in PARALLEL...")
+print("\n📥 Fetching max available history per pair (H1 for depth) in PARALLEL...")
 _t0 = time.time()
 
 with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(INSTRUMENTS + MACRO_ASSETS), 12)) as ex:
