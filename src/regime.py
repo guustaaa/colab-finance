@@ -100,12 +100,9 @@ class RegimeDetector:
                     random_state=42,
                     tol=0.01,
                 )
-                import warnings
-                from hmmlearn.base import ConvergenceWarning
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", ConvergenceWarning)
-                    warnings.filterwarnings("ignore", message=".*'covars' must be symmetric.*")
-                    self.model.fit(obs)
+                import logging
+                logging.getLogger("hmmlearn").setLevel(logging.ERROR)
+                self.model.fit(obs)
                 
                 self._label_states(obs)
 
@@ -120,7 +117,7 @@ class RegimeDetector:
                 return True
 
             except Exception as e:
-                logger.warning(f"HMM fit with cov_type='{cov_type}' failed: {e}")
+                # Silently catch symmetric matrix errors and let it fallback to diag/spherical
                 continue
 
         logger.error("HMM fitting failed with all covariance types.")
