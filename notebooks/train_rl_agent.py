@@ -21,6 +21,24 @@ def main():
     print("🤖 PHASE 2: DEEP REINFORCEMENT LEARNING (PPO) TRAINER")
     print("=" * 60)
     
+    # ─────────────────────────────────────────────
+    # Load credentials from Colab/Kaggle Secrets
+    # ─────────────────────────────────────────────
+    secret_keys = ["CAPITAL_API_KEY", "CAPITAL_EMAIL", "CAPITAL_PASSWORD"]
+    try:
+        from kaggle_secrets import UserSecretsClient
+        user_secrets = UserSecretsClient()
+        for secret_name in secret_keys:
+            try:
+                val = user_secrets.get_secret(secret_name)
+                if val:
+                    os.environ[secret_name] = val
+                    print(f"✅ Secret loaded: {secret_name}")
+            except Exception:
+                pass
+    except ImportError:
+        pass
+        
     fetcher = CapitalFetcher(demo=True)
     scanner = SentimentScanner()
     articles = scanner.scan_all_feeds()
@@ -34,7 +52,7 @@ def main():
     
     inst = "EUR_USD"
     print(f"  Fetching max history for {inst}...")
-    df = fetcher.fetch_candles(
+    df = fetcher.fetch_bulk_history(
         inst, count=TRAINING_HISTORY_COUNT, 
         granularity=TRADING_GRANULARITY, 
         cache_path=f"cache/{inst}_h1.parquet"
