@@ -149,6 +149,11 @@ def compute_all_features(
     # ──────── DROP NaN ────────
     feat.dropna(inplace=True)
 
+    # ──────── MEMORY OPTIMIZATION ────────
+    # Downcast float64 to float32 to halve RAM usage and vastly speed up GPU/CPU training ops
+    float_cols = feat.select_dtypes(include=['float64']).columns
+    feat[float_cols] = feat[float_cols].astype(np.float32)
+
     logger.info(f"Feature engineering: {len(feat)} rows, {len(feat.columns)} features")
     return feat
 
