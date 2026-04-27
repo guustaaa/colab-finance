@@ -441,6 +441,13 @@ notifier.send(
     "info"
 )
 
+if _train_errors:
+    raise RuntimeError(
+        f"❌ Critical Failure: {len(_train_errors)} models failed to train!\n"
+        "The live trading loop will NOT start because these models are completely untrained.\n"
+        "Please review the traceback errors above to identify the issue before wasting Kaggle GPU quotas."
+    )
+
 # Reload regime detectors from saved models (they were trained in subthreads)
 import joblib as _joblib
 for inst in INSTRUMENTS:

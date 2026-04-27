@@ -42,6 +42,9 @@ def compute_all_features(
         return pd.DataFrame()
 
     feat = df.copy()
+    
+    # Strictly deduplicate index to prevent alignment/reindex panics down the pipeline
+    feat = feat[~feat.index.duplicated(keep="last")]
 
     # ──────── 1. RETURNS & LOG RETURNS ────────
     feat["returns"] = feat["close"].pct_change()
