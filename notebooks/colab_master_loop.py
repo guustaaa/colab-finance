@@ -166,12 +166,13 @@ from src.execution import RiskManager, CapitalExecutor
 from src.utils import Notifier, StateManager, TradeJournal, setup_logger
 
 # Setup logging — force-clear stale handlers from previous cell runs
-log_dir = os.path.join(STATE_DIR, "logs")
-for _name in ["colab_master", "data_fetcher", "regime", "ensemble", "notifier", "execution"]:
+log_dir = os.path.join(DRIVE_LOGS_DIR) if 'DRIVE_LOGS_DIR' in locals() else "./logs"
+for _name in ["colab_master", "data_fetcher", "regime", "ensemble", "notifier", "execution", "sentiment"]:
     _lg = logging.getLogger(_name)
     _lg.handlers.clear()
     _lg.propagate = False
-logger = setup_logger("colab_master", log_dir)
+    setup_logger(_name, log_dir)
+logger = logging.getLogger("colab_master")
 
 # Initialize all components
 notifier = Notifier(WEBHOOK_URL)
@@ -360,7 +361,7 @@ _train_errors  = {}
 with concurrent.futures.ThreadPoolExecutor(max_workers=len(INSTRUMENTS)) as ex:
     _futures = {
         ex.submit(_train_one_instrument, inst, raw_data[inst], _articles, raw_data): inst
-        for inst in raw_data
+        for inst in INSTRUMENTS if inst in raw_data
     }
 
     _completed = 0
