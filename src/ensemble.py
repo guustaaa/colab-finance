@@ -338,9 +338,9 @@ class EnsembleEngine:
       Factor model → XGB/LGB → DNN stacker → regime-weighted output.
     """
 
-    def __init__(self, model_path: str = "", cross_pairs: list = None):
+    def __init__(self, model_path: str = "", cross_pairs: list = None, gpu_id: int = None):
         self.factor_model = FactorModel()
-        self.ml_model = XGBoostPredictor(model_path=model_path, cross_pairs=cross_pairs)
+        self.ml_model = XGBoostPredictor(model_path=model_path, cross_pairs=cross_pairs, gpu_id=gpu_id)
 
     def train(self, df: pd.DataFrame) -> dict:
         df = df.copy()
