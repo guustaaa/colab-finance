@@ -6,7 +6,7 @@ import logging
 # Ensure src is in python path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from src.config import INSTRUMENTS, DRIVE_MODELS_DIR, TRADING_GRANULARITY, TRAINING_HISTORY_COUNT
+from src.config import INSTRUMENTS, DRIVE_MODELS_DIR, TRADING_GRANULARITY, BULK_HISTORY_YEARS
 from src.data_fetcher import CapitalFetcher
 from src.features import compute_all_features
 from src.sentiment import SentimentScanner
@@ -52,8 +52,9 @@ def main():
     
     inst = "EUR_USD"
     print(f"  Fetching max history for {inst}...")
+    os.makedirs("cache", exist_ok=True)
     df = fetcher.fetch_bulk_history(
-        inst, count=TRAINING_HISTORY_COUNT, 
+        inst, years=BULK_HISTORY_YEARS, 
         granularity=TRADING_GRANULARITY, 
         cache_path=f"cache/{inst}_h1.parquet"
     )
