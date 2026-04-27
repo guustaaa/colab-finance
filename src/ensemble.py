@@ -169,13 +169,14 @@ class DeepStacker:
 class XGBoostPredictor:
     """XGBoost + LightGBM + DNN stacker ensemble."""
 
-    def __init__(self, model_path: str = "", cross_pairs: list = None):
+    def __init__(self, model_path: str = "", cross_pairs: list = None, gpu_id: int = None):
         self.model_path = model_path
         self.model = None
         self.lgb_model = None
         self.dnn = DeepStacker()
         self.cross_pairs = cross_pairs or []
         self.feature_cols = get_feature_columns(self.cross_pairs)
+        self.gpu_id = gpu_id
 
     def train(self, df: pd.DataFrame, target_col: str = "target") -> dict:
         if df.empty or target_col not in df.columns:
@@ -196,6 +197,11 @@ class XGBoostPredictor:
         X = df[available_features]
         y = df[target_col]
 
+        # Inject specific GPU device if running in multi-GPU (T4x2)
+        _xgb_params = XGB_PARAMS.copy()
+        if self.gpu_id is not None and _xgb_params.get("device") == "cuda":
+            _xgb_params["device"] = f"cuda:{self.gpu_id}"
+
         # ── Walk-Forward Cross-Validation ──
         n_splits = min(5, max(2, len(X) // 80))
         tscv = TimeSeriesSplit(n_splits=n_splits)
@@ -205,7 +211,7 @@ class XGBoostPredictor:
             X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
             y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
 
-            xgb_model = xgb.XGBClassifier(**XGB_PARAMS)
+            xgb_model = xgb.XGBClassifier(**_xgb_params)
             xgb_model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
             score = xgb_model.score(X_test, y_test)
             wf_scores.append(score)
@@ -215,7 +221,7 @@ class XGBoostPredictor:
         X_tr, X_val = X.iloc[:split], X.iloc[split:]
         y_tr, y_val = y.iloc[:split], y.iloc[split:]
 
-        self.model = xgb.XGBClassifier(**XGB_PARAMS)
+        self.model = xgb.XGBClassifier(**_xgb_params)
         self.model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
 
         self.lgb_model = lgb.LGBMClassifier(**LGB_PARAMS)

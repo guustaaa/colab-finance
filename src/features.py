@@ -124,11 +124,13 @@ def compute_all_features(
 
     # ──────── 8. CROSS-PAIR CORRELATION ────────
     if cross_pair_data:
+        feat = feat[~feat.index.duplicated(keep="last")]
         own_ret = feat["returns"]
         for pair_name, pair_df in cross_pair_data.items():
             if pair_df is None or pair_df.empty:
                 continue
-            # Align indices
+            # Align indices safely by ensuring unique labels
+            pair_df = pair_df[~pair_df.index.duplicated(keep="last")]
             pair_ret = pair_df["close"].pct_change().reindex(feat.index)
             # Rolling correlation
             corr = own_ret.rolling(48, min_periods=24).corr(pair_ret)

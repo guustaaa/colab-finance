@@ -333,7 +333,7 @@ print("   Models are saved to Drive every 5 minutes.\n")
 _train_start = time.time()
 _checkpoint_interval = 300  # 5 minutes
 
-def _train_one_instrument(inst, df, articles, all_raw_data):
+def _train_one_instrument(inst, df, articles, all_raw_data, gpu_id=0):
     """
     Full training pipeline for one instrument.
     Returns (inst, ens, metrics) or (inst, None, error_msg) on failure.
@@ -364,7 +364,7 @@ def _train_one_instrument(inst, df, articles, all_raw_data):
 
         # Train ensemble (XGB + LGB + DNN stacker) with cross-pair awareness
         ens_path = os.path.join(DRIVE_MODELS_DIR, f"ensemble_{inst}.joblib")
-        ens = EnsembleEngine(model_path=ens_path, cross_pairs=other_pairs)
+        ens = EnsembleEngine(model_path=ens_path, cross_pairs=other_pairs, gpu_id=gpu_id)
         metrics = ens.train(features)
 
         # Persist to Drive
@@ -387,10 +387,12 @@ _train_results = {}
 _train_errors  = {}
 
 with concurrent.futures.ThreadPoolExecutor(max_workers=len(INSTRUMENTS)) as ex:
-    _futures = {
-        ex.submit(_train_one_instrument, inst, raw_data[inst], _articles, raw_data): inst
-        for inst in INSTRUMENTS if inst in raw_data
-    }
+    _futures = {}
+    for i, inst in enumerate(INSTRUMENTS):
+        if inst in raw_data:
+            gpu_id = i % 2  # Distribute across T4x2
+            fut = ex.submit(_train_one_instrument, inst, raw_data[inst], _articles, raw_data, gpu_id)
+            _futures[fut] = inst
 
     _completed = 0
     _next_checkpoint_log = time.time() + _checkpoint_interval
