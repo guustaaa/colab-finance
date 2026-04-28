@@ -55,8 +55,9 @@ class RLAgent:
         self.params = self.network.init(init_rng, dummy_obs)
         opt_state = self.optimizer.init(self.params)
         
-        replicated_params = jax.tree_map(lambda x: jnp.stack([x] * num_devices), self.params)
-        replicated_opt_state = jax.tree_map(lambda x: jnp.stack([x] * num_devices), opt_state)
+        # Updated to jax.tree.map for JAX v0.6.0+
+        replicated_params = jax.tree.map(lambda x: jnp.stack([x] * num_devices), self.params)
+        replicated_opt_state = jax.tree.map(lambda x: jnp.stack([x] * num_devices), opt_state)
 
         def ppo_loss(params, obs, actions, advantages, returns, old_log_probs):
             logits, values = self.network.apply(params, obs)
@@ -129,7 +130,8 @@ class RLAgent:
             if epoch % 10 == 0:
                 logger.info(f"Epoch {epoch}/{epochs} | Loss: {jnp.mean(loss):.4f}")
 
-        self.params = jax.tree_map(lambda x: x[0], replicated_params)
+        # Updated to jax.tree.map for JAX v0.6.0+
+        self.params = jax.tree.map(lambda x: x[0], replicated_params)
         
         os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
         with open(self.model_path, 'wb') as f:
