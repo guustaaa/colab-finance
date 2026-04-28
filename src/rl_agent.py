@@ -88,10 +88,14 @@ class RLAgent:
         self.params = None
         
     def train(self, data_dict: dict, total_timesteps: int = 500_000_000):
-        # 🛠️ Rebalanced for Dual T4 Stability (1 Million steps per rollout)
-        N_ENVS = 8192
-        CHUNK_SIZE = 128
-        NUM_MINIBATCHES = 16 # Splits the chunk into 16 digestible VRAM blocks
+        # =====================================================================
+        # 🚀 THE 14GB VRAM TITAN CONFIGURATION
+        # Maximizes the Dual T4 hardware limits productively.
+        # =====================================================================
+        N_ENVS = 65536         # 65,536 parallel universes (was 8,192)
+        CHUNK_SIZE = 256       # 256 temporal steps per universe (was 128)
+        NUM_MINIBATCHES = 64   # 64 slices to prevent backward-pass OOM (was 16)
+        # =====================================================================
         
         logger.info(f"Aggregating data from {len(data_dict)} currency pairs...")
         combined_df = pd.concat(list(data_dict.values()), ignore_index=True)
