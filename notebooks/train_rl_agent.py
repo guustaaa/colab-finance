@@ -60,7 +60,7 @@ def main():
     logger.info("🧠 Spawning Hybrid PST-Trader Matrix Environments...")
     
     # Ensure it's looking for the new hybrid model file
-    agent = RLAgent(model_path="/kaggle/working/ForexAI_State/models/rl_hybrid_agent.pkl")
+    agent = RLAgent(model_path="/kaggle/working/ForexAI_State/models/rl_hybrid_agent-v4.pkl")
     
     # 2. PUSH THE T4 GPUs TO MAXIMUM CAPACITY
     # Note: n_envs and batch_size are now hardcoded in the agent for max VRAM usage

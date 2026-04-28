@@ -19,41 +19,41 @@ from src.environment import JaxForexEnv
 logger = logging.getLogger("rl_agent")
 
 # =====================================================================
-# 🧠 HYBRID PST-TRADER ARCHITECTURE (Actor-Critic + SAC + TD3)
+# 🧠 TRUE DECOUPLED PST-TRADER (LayerNorm + PPO + SAC + TD3)
 # =====================================================================
 
 class Actor(nn.Module):
     action_dim: int
     @nn.compact
     def __call__(self, x):
-        # 🛡️ Orthogonal Init prevents initial activation explosions
-        init_fn = nn.initializers.orthogonal(np.sqrt(2))
+        # 🛡️ FATAL FLAW FIXED: Normalize wildly different Forex pairs!
+        x = nn.LayerNorm()(x)
         
-        x = nn.Dense(1024, kernel_init=init_fn)(x)
-        x = nn.tanh(x)
-        x = nn.Dense(1024, kernel_init=init_fn)(x)
+        init_fn = nn.initializers.orthogonal(np.sqrt(2))
+        x = nn.Dense(512, kernel_init=init_fn)(x)
         x = nn.tanh(x)
         x = nn.Dense(512, kernel_init=init_fn)(x)
         x = nn.tanh(x)
         
-        # Scale down final layer so initial actions are completely random (high entropy)
+        # Scale down final layer for high initial exploration
         logits = nn.Dense(self.action_dim, kernel_init=nn.initializers.orthogonal(0.01))(x)
         return logits
 
 class TwinCritic(nn.Module):
     @nn.compact
     def __call__(self, x):
+        x = nn.LayerNorm()(x)
         init_fn = nn.initializers.orthogonal(np.sqrt(2))
         
         # Critic 1
-        c1 = nn.Dense(1024, kernel_init=init_fn)(x)
+        c1 = nn.Dense(512, kernel_init=init_fn)(x)
         c1 = nn.relu(c1)
         c1 = nn.Dense(512, kernel_init=init_fn)(c1)
         c1 = nn.relu(c1)
         v1 = nn.Dense(1, kernel_init=nn.initializers.orthogonal(1.0))(c1)
         
         # Critic 2
-        c2 = nn.Dense(1024, kernel_init=init_fn)(x)
+        c2 = nn.Dense(512, kernel_init=init_fn)(x)
         c2 = nn.relu(c2)
         c2 = nn.Dense(512, kernel_init=init_fn)(c2)
         c2 = nn.relu(c2)
@@ -73,21 +73,22 @@ class HybridNetwork(nn.Module):
         return logits, v1, v2
 
 class RLAgent:
-    def __init__(self, model_path: str = "/kaggle/working/ForexAI_State/models/rl_pst_trader_v3.pkl", device: str = "auto"):
+    def __init__(self, model_path: str = "/kaggle/working/ForexAI_State/models/rl_pst_trader_v4.pkl", device: str = "auto"):
         self.model_path = model_path
         self.action_dim = 4
         self.network = HybridNetwork(action_dim=self.action_dim)
         
+        # Hard Trust Region bounds
         self.optimizer = optax.chain(
             optax.clip_by_global_norm(0.5),
-            optax.adam(learning_rate=1e-4)
+            optax.adam(learning_rate=3e-4)
         )
         self.params = None
         
     def train(self, data_dict: dict, total_timesteps: int = 500_000_000):
-        # 🚀 RAM MAXIMIZATION PARAMETERS 
-        N_ENVS = 16384       # 16k parallel universes
-        CHUNK_SIZE = 500     # 500 steps per universe per loop
+        # Memory-Optimized Batching for T4 GPUs
+        N_ENVS = 16384
+        CHUNK_SIZE = 500
         
         logger.info(f"Aggregating data from {len(data_dict)} currency pairs...")
         combined_df = pd.concat(list(data_dict.values()), ignore_index=True)
@@ -95,7 +96,7 @@ class RLAgent:
         
         env = JaxForexEnv(data_matrix=data_matrix)
         num_devices = jax.local_device_count()
-        logger.info(f"⚙️ Compute Engine: {num_devices}x GPU")
+        logger.info(f"⚙️ Compute Engine: {num_devices}x GPU | Matrix Size: {N_ENVS}x{CHUNK_SIZE}")
         
         rng = jax.random.PRNGKey(42)
         rng, init_rng = jax.random.split(rng)
@@ -105,87 +106,84 @@ class RLAgent:
         opt_state = self.optimizer.init(self.params)
         
         if self.load():
-            logger.info("Resuming from existing Hybrid Checkpoint...")
+            logger.info("Resuming from safe v4 Checkpoint...")
             
         replicated_params = jax.tree.map(lambda x: jnp.stack([x] * num_devices), self.params)
         replicated_opt_state = jax.tree.map(lambda x: jnp.stack([x] * num_devices), opt_state)
 
-        # ---------------------------------------------------------
-        # HYBRID LOSS FUNCTION (WITH HUBER SHOCK ABSORBERS)
-        # ---------------------------------------------------------
         def huber_loss(x, delta=1.0):
             return jnp.where(jnp.abs(x) < delta, 0.5 * x**2, delta * (jnp.abs(x) - 0.5 * delta))
 
-        def hybrid_loss(params, obs, actions, norm_advantages, target_v):
-            logits, v1, v2 = self.network.apply(params, obs)
-            
-            log_probs = jax.nn.log_softmax(logits)
-            action_log_probs = jnp.take_along_axis(log_probs, actions[:, None], axis=-1).squeeze(-1)
-            
-            # 1. Actor Loss (Policy Gradient with normalized advantages)
-            loss_actor = -jnp.mean(action_log_probs * norm_advantages)
-            
-            # 2. TD3 Critic Update (Huber Loss prevents squaring explosions)
-            loss_critic1 = jnp.mean(huber_loss(v1 - target_v))
-            loss_critic2 = jnp.mean(huber_loss(v2 - target_v))
-            loss_critic = loss_critic1 + loss_critic2
-            
-            # 3. SAC Soft-Entropy Maximization
-            entropy = -jnp.mean(jnp.sum(jax.nn.softmax(logits) * log_probs, axis=-1))
-            sac_alpha = 0.05 
-            
-            total_loss = loss_actor + (0.5 * loss_critic) - (sac_alpha * entropy)
-            return total_loss
-
+        # ---------------------------------------------------------
+        # TRUE DECOUPLED PPO ENGINE
+        # ---------------------------------------------------------
         @partial(jax.pmap, axis_name='p')
         def process_chunk(params, opt_state, rng, states, obs):
-            def _step(carry, unused):
-                params, opt_state, rng, states, obs = carry
+            
+            # PHASE 1: ROLLOUT (Collect trajectories without changing weights)
+            def rollout_step(carry, unused):
+                rng, states, obs = carry
                 rng, step_rng = jax.random.split(rng)
                 
-                # 1. Forward Pass (Current State)
                 logits, v1, v2 = self.network.apply(params, obs)
                 v_curr = jnp.minimum(v1, v2)
                 
                 actions = jax.random.categorical(step_rng, logits)
+                log_probs = jnp.take_along_axis(jax.nn.log_softmax(logits), actions[:, None], axis=-1).squeeze(-1)
                 
-                # 2. Step parallel worlds
                 next_obs, next_states, rewards, dones, infos = jax.vmap(env.step)(states, actions)
                 
-                # 3. Forward Pass (Next State) - purely to calculate the target
-                _, next_v1, next_v2 = self.network.apply(params, next_obs)
-                v_next = jnp.minimum(next_v1, next_v2)
-                
-                # 🛡️ THE SHIELD: Bellman Target with Stop-Gradient
-                # This breaks the infinite mathematical feedback loop
-                target_v = rewards + 0.99 * v_next * (1.0 - dones)
-                target_v = jax.lax.stop_gradient(target_v)
-                
-                advantages = target_v - v_curr
-                advantages = jax.lax.stop_gradient(advantages)
-                
-                # 🛡️ Advantage Normalization (Pins gradients inside a safe bell curve)
-                adv_mean = jnp.mean(advantages)
-                adv_std = jnp.std(advantages) + 1e-8
-                norm_advantages = (advantages - adv_mean) / adv_std
-                
-                # 4. Backprop
-                grad_fn = jax.value_and_grad(hybrid_loss)
-                loss, grads = grad_fn(params, obs, actions, norm_advantages, target_v)
-                grads = jax.lax.pmean(grads, axis_name='p')
-                updates, opt_state = self.optimizer.update(grads, opt_state)
-                params = optax.apply_updates(params, updates)
-                
-                return (params, opt_state, rng, next_states, next_obs), (loss, rewards)
+                transition = (obs, actions, log_probs, rewards, v_curr, dones)
+                return (rng, next_states, next_obs), transition
 
-            carry = (params, opt_state, rng, states, obs)
-            carry, (losses, rewards) = jax.lax.scan(_step, carry, None, length=CHUNK_SIZE)
-            params, opt_state, rng, states, obs = carry
-            return params, opt_state, rng, states, obs, jnp.mean(losses), jnp.mean(rewards)
+            (rng, states, next_obs), trajectories = jax.lax.scan(rollout_step, (rng, states, obs), None, length=CHUNK_SIZE)
+            obs_batch, actions_batch, log_probs_batch, rewards_batch, values_batch, dones_batch = trajectories
+            
+            # PHASE 2: REVERSE BELLMAN ESTIMATION
+            _, next_v1, next_v2 = self.network.apply(params, next_obs)
+            next_v = jnp.minimum(next_v1, next_v2)
+            
+            def compute_returns(carry, transition):
+                r, d = transition
+                ret = r + 0.99 * carry * (1.0 - d)
+                return ret, ret
+                
+            _, returns_batch = jax.lax.scan(compute_returns, next_v, (rewards_batch, dones_batch), reverse=True)
+            
+            advantages_batch = returns_batch - values_batch
+            adv_mean = jnp.mean(advantages_batch)
+            adv_std = jnp.std(advantages_batch) + 1e-8
+            norm_advantages_batch = (advantages_batch - adv_mean) / adv_std
+            
+            # PHASE 3: NETWORK UPDATE (With active PPO Clipping)
+            def loss_fn(params_to_update):
+                # Apply network to the entire batch of historical states
+                logits, v1, v2 = self.network.apply(params_to_update, obs_batch)
+                
+                new_log_probs_full = jax.nn.log_softmax(logits)
+                new_log_probs = jnp.take_along_axis(new_log_probs_full, actions_batch[..., None], axis=-1).squeeze(-1)
+                
+                # 🛡️ THIS IS TRUE PPO CLIPPING: It now correctly compares New vs Old
+                ratio = jnp.exp(new_log_probs - log_probs_batch)
+                clip_adv = jnp.clip(ratio, 0.8, 1.2) * norm_advantages_batch
+                loss_actor = -jnp.mean(jnp.minimum(ratio * norm_advantages_batch, clip_adv))
+                
+                loss_critic = 0.5 * jnp.mean(huber_loss(v1 - returns_batch)) + 0.5 * jnp.mean(huber_loss(v2 - returns_batch))
+                
+                entropy = -jnp.mean(jnp.sum(jax.nn.softmax(logits) * new_log_probs_full, axis=-1))
+                
+                return loss_actor + 0.5 * loss_critic - 0.05 * entropy
+
+            grad_fn = jax.value_and_grad(loss_fn)
+            loss, grads = grad_fn(params)
+            grads = jax.lax.pmean(grads, axis_name='p')
+            updates, opt_state = self.optimizer.update(grads, opt_state)
+            params = optax.apply_updates(params, updates)
+            
+            return params, opt_state, rng, states, next_obs, loss, jnp.mean(rewards_batch)
         
         steps_per_epoch = N_ENVS * CHUNK_SIZE
         state_keys = jax.random.split(rng, num_devices)
-        step_rngs = jax.random.split(jax.random.split(rng)[1], num_devices)
         
         @partial(jax.pmap, axis_name='p')
         def init_envs(key):
@@ -199,22 +197,20 @@ class RLAgent:
         states = init_envs(state_keys)
         obs = get_obs_pmap(states)
 
-        logger.info(f"🚀 PST-TRADER IGNITION: Ram Overdrive Mode Enabled.")
-        logger.info(f"🛡️ Math Shields Online: Bellman Freezing, Huber Loss, Orthogonal Vectors.")
+        logger.info(f"🚀 TRUE DECOUPLED PPO ENGINE ONLINE.")
         start_time = time.time()
         
         epoch = 0
         while True:
-            replicated_params, replicated_opt_state, step_rngs, states, obs, loss_mean, reward_mean = process_chunk(
-                replicated_params, replicated_opt_state, step_rngs, states, obs
+            replicated_params, replicated_opt_state, rng, states, obs, loss_mean, reward_mean = process_chunk(
+                replicated_params, replicated_opt_state, rng, states, obs
             )
 
             current_loss = jnp.mean(loss_mean)
             current_reward = jnp.mean(reward_mean)
 
-            # Failsafe Auto-Recovery
             if current_loss > 1000.0 or jnp.isnan(current_loss):
-                logger.error(f"🚨 Anomalous Loss Detected ({current_loss}). Reverting to safe checkpoint...")
+                logger.error(f"🚨 Math Integrity Warning ({current_loss}). Rebooting safely...")
                 if self.load():
                     replicated_params = jax.tree.map(lambda x: jnp.stack([x] * num_devices), self.params)
                     opt_state = self.optimizer.init(self.params)
@@ -222,7 +218,7 @@ class RLAgent:
                     states = init_envs(state_keys)
                     obs = get_obs_pmap(states)
                     continue
-                    
+
             if epoch % 5 == 0:
                 elapsed = time.time() - start_time
                 fps = int((epoch * steps_per_epoch) / elapsed) if elapsed > 0 else 0
@@ -232,7 +228,7 @@ class RLAgent:
                 win_rate = (winning_trades_count / jnp.maximum(1, total_trades_count)) * 100.0
 
                 print(f"----------------------------------------")
-                print(f"| PST-TRADER PERFORMANCE  |            |")
+                print(f"| DECOUPLED PST-TRADER    |            |")
                 print(f"|    fps                  | {fps:<10} |")
                 print(f"|    total_timesteps      | {epoch * steps_per_epoch:<10} |")
                 print(f"| accuracy/               |            |")
@@ -243,14 +239,12 @@ class RLAgent:
                 print(f"|    loss                 | {current_loss:<10.5f} |")
                 print(f"----------------------------------------")
 
-            # Local Save
             if epoch % 20 == 0 and epoch > 0:
                 self.params = jax.tree.map(lambda x: x[0], replicated_params)
                 os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
                 with open(self.model_path, 'wb') as f:
                     pickle.dump(self.params, f)
-                logger.info(f"💾 Hybrid Weights Checkpoint Saved.")
-            
+                logger.info(f"💾 v4 Checkpoint Saved.")
             epoch += 1
 
     def load(self):
@@ -259,10 +253,3 @@ class RLAgent:
                 self.params = pickle.load(f)
             return True
         return False
-
-    def predict(self, obs: np.ndarray) -> int:
-        if self.params is None:
-            return 0
-        obs_jnp = jnp.array(obs, dtype=jnp.float32)
-        logits, _, _ = self.network.apply(self.params, obs_jnp)
-        return int(jnp.argmax(logits))
