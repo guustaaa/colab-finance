@@ -1,102 +1,153 @@
 import os
-# Silences the TensorFlow/JAX duplicate registration warnings
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3" 
-# Prevents JAX from allocating 90% of the GPU memory on startup
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-# Allows GPU memory to grow dynamically 
 os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
 
-import os
-import logging
+import jax
+import jax.numpy as jnp
+import flax.linen as nn
+import optax
 import numpy as np
-from typing import List, Optional
 import pandas as pd
-from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
-from src.environment import ForexEnv
+import logging
+import pickle
+from functools import partial
+from src.environment import JaxForexEnv
 
 logger = logging.getLogger("rl_agent")
 
+class ActorCritic(nn.Module):
+    action_dim: int
+
+    @nn.compact
+    def __call__(self, x):
+        x = nn.Dense(256)(x)
+        x = nn.tanh(x)
+        x = nn.Dense(256)(x)
+        x = nn.tanh(x)
+        
+        logits = nn.Dense(self.action_dim)(x)
+        value = nn.Dense(1)(x)
+        return logits, jnp.squeeze(value, axis=-1)
+
 class RLAgent:
-    """
-    Deep Reinforcement Learning Agent using Proximal Policy Optimization (PPO).
-    Wraps the stable-baselines3 model and the vectorized custom gym environment.
-    """
-    
-    def __init__(self, model_path: str = "models/ppo_agent.zip", device: str = "auto"):
+    def __init__(self, model_path: str = "models/ppo_agent.pkl", device: str = "auto"):
         self.model_path = model_path
-        self.model = None
-        self.device = device
+        self.action_dim = 4
+        self.network = ActorCritic(action_dim=self.action_dim)
+        self.optimizer = optax.adam(learning_rate=3e-4)
+        self.params = None
         
-    def _make_env(self, df: pd.DataFrame, spread: float = 0.0001, window_size: int = 60):
-        def _init():
-            return ForexEnv(df=df, spread=spread, window_size=window_size)
-        return _init
-
     def train(self, data_dict: dict, total_timesteps: int = 1_000_000, n_envs: int = 4):
-        """
-        Train the PPO agent on multiple instruments concurrently using vectorized environments.
-        
-        Parameters:
-        - data_dict: dict mapping instrument names to their feature DataFrames
-        - total_timesteps: Total number of steps to simulate across all envs
-        - n_envs: Number of parallel environments (matches CPU cores on Kaggle)
-        """
-        if not data_dict:
-            logger.error("No data provided for RL training.")
-            return
-
-        # Combine all dfs into one large list for random env selection, or just use the first for simplicity
-        # In a full implementation, you'd multiplex the instruments
-        # For this prototype, we'll use the combined continuous dataframe or just pick the largest one
-        
         first_inst = list(data_dict.keys())[0]
         df = data_dict[first_inst]
         
-        logger.info(f"Setting up {n_envs} vectorized environments...")
-        # Use SubprocVecEnv for true multiprocessing on Kaggle CPUs
-        vec_env = SubprocVecEnv([self._make_env(df) for _ in range(n_envs)], start_method="spawn")
+        data_matrix = jnp.array(df.values, dtype=jnp.float32)
+        env = JaxForexEnv(data_matrix=data_matrix)
         
-        logger.info("Initializing PPO Neural Network (Actor-Critic)...")
-        self.model = PPO(
-            "MlpPolicy", 
-            vec_env, 
-            verbose=1,
-            learning_rate=3e-4,
-            n_steps=2048,
-            batch_size=64,
-            n_epochs=10,
-            gamma=0.99,
-            gae_lambda=0.95,
-            clip_range=0.2,
-            ent_coef=0.01,
-            device=self.device
-        )
+        num_devices = jax.local_device_count()
+        logger.info(f"Using {num_devices} JAX devices")
+
+        rng = jax.random.PRNGKey(42)
+        rng, init_rng = jax.random.split(rng)
         
-        logger.info(f"Starting heavy RL simulation ({total_timesteps:,} steps)...")
-        self.model.learn(total_timesteps=total_timesteps)
+        dummy_obs, _ = env.reset()
+        self.params = self.network.init(init_rng, dummy_obs)
+        opt_state = self.optimizer.init(self.params)
         
-        # Save the .zip containing the PyTorch .pt weights
+        replicated_params = jax.tree_map(lambda x: jnp.stack([x] * num_devices), self.params)
+        replicated_opt_state = jax.tree_map(lambda x: jnp.stack([x] * num_devices), opt_state)
+
+        def ppo_loss(params, obs, actions, advantages, returns, old_log_probs):
+            logits, values = self.network.apply(params, obs)
+            log_probs = jax.nn.log_softmax(logits)
+            action_log_probs = jnp.take_along_axis(log_probs, actions[:, None], axis=-1).squeeze(-1)
+            
+            ratio = jnp.exp(action_log_probs - old_log_probs)
+            clip_adv = jnp.clip(ratio, 0.8, 1.2) * advantages
+            loss_actor = -jnp.mean(jnp.minimum(ratio * advantages, clip_adv))
+            loss_critic = 0.5 * jnp.mean((returns - values) ** 2)
+            entropy = -jnp.mean(jnp.sum(jax.nn.softmax(logits) * log_probs, axis=-1))
+            
+            return loss_actor + 0.5 * loss_critic - 0.01 * entropy
+
+        @partial(jax.pmap, axis_name='p')
+        def update_step(params, opt_state, obs, actions, advantages, returns, old_log_probs):
+            grad_fn = jax.value_and_grad(ppo_loss)
+            loss, grads = grad_fn(params, obs, actions, advantages, returns, old_log_probs)
+            grads = jax.lax.pmean(grads, axis_name='p')
+            updates, opt_state = self.optimizer.update(grads, opt_state)
+            params = optax.apply_updates(params, updates)
+            return params, opt_state, loss
+
+        @partial(jax.pmap, axis_name='p')
+        def act(params, rng, obs):
+            logits, val = self.network.apply(params, obs)
+            action = jax.random.categorical(rng, logits)
+            log_prob = jnp.take_along_axis(jax.nn.log_softmax(logits), action[:, None], axis=-1).squeeze(-1)
+            return action, log_prob, val
+
+        batch_size = 2048
+        epochs = total_timesteps // (batch_size * num_devices)
+        
+        state_keys = jax.random.split(rng, num_devices)
+        
+        @partial(jax.pmap, axis_name='p')
+        def init_envs(key):
+            keys = jax.random.split(key, n_envs // num_devices)
+            return jax.vmap(lambda k: env.reset()[1])(keys)
+
+        @partial(jax.pmap, axis_name='p')
+        def get_obs_pmap(states):
+            return jax.vmap(env._get_obs)(states)
+
+        states = init_envs(state_keys)
+        obs = get_obs_pmap(states)
+
+        for epoch in range(epochs):
+            rng, step_rng = jax.random.split(rng)
+            step_rngs = jax.random.split(step_rng, num_devices)
+            
+            actions, log_probs, values = act(replicated_params, step_rngs, obs)
+            
+            @partial(jax.pmap, axis_name='p')
+            def step_envs(states, actions):
+                return jax.vmap(env.step)(states, actions)
+
+            next_obs, next_states, rewards, dones, infos = step_envs(states, actions)
+            
+            advantages = rewards - values
+            returns = rewards + 0.99 * values
+            
+            replicated_params, replicated_opt_state, loss = update_step(
+                replicated_params, replicated_opt_state, obs, actions, advantages, returns, log_probs
+            )
+            
+            obs = next_obs
+            states = next_states
+
+            if epoch % 10 == 0:
+                logger.info(f"Epoch {epoch}/{epochs} | Loss: {jnp.mean(loss):.4f}")
+
+        self.params = jax.tree_map(lambda x: x[0], replicated_params)
+        
         os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
-        self.model.save(self.model_path)
-        logger.info(f"RL PPO Agent saved to {self.model_path}")
+        with open(self.model_path, 'wb') as f:
+            pickle.dump(self.params, f)
+        logger.info(f"RL Agent saved to {self.model_path}")
 
     def load(self):
-        """Load the pre-trained PPO model from disk."""
-        if os.path.exists(self.model_path) or os.path.exists(self.model_path + ".zip"):
-            self.model = PPO.load(self.model_path, device=self.device)
+        if os.path.exists(self.model_path):
+            with open(self.model_path, 'rb') as f:
+                self.params = pickle.load(f)
             logger.info(f"Loaded RL Agent from {self.model_path}")
             return True
         logger.warning(f"Could not find RL Agent at {self.model_path}")
         return False
 
     def predict(self, obs: np.ndarray) -> int:
-        """
-        Predict the best action given the current environment observation.
-        Returns the action (0: Hold, 1: Buy, 2: Sell, 3: Close)
-        """
-        if self.model is None:
+        if self.params is None:
             return 0
-            
-        action, _states = self.model.predict(obs, deterministic=True)
-        return int(action)
+        obs_jnp = jnp.array(obs, dtype=jnp.float32)
+        logits, _ = self.network.apply(self.params, obs_jnp)
+        return int(jnp.argmax(logits))

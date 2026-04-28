@@ -1,191 +1,141 @@
-import gymnasium as gym
-from gymnasium import spaces
-import numpy as np
-import pandas as pd
-import logging
+import jax
+import jax.numpy as jnp
+from flax import struct
+from typing import Tuple, Dict
 
-logger = logging.getLogger("rl_env")
+@struct.dataclass
+class EnvState:
+    current_step: jnp.ndarray
+    balance: jnp.ndarray
+    net_worth: jnp.ndarray
+    max_net_worth: jnp.ndarray
+    position: jnp.ndarray
+    entry_price: jnp.ndarray
+    units: jnp.ndarray
 
-class ForexEnv(gym.Env):
-    """
-    Custom Vectorized Reinforcement Learning Environment for Forex Trading.
-    Compatible with stable-baselines3 and gymnasium.
-    """
-    metadata = {'render_modes': ['human', 'console']}
-
-    def __init__(self, df: pd.DataFrame, initial_balance=1000.0, spread=0.0001, window_size=60):
-        super(ForexEnv, self).__init__()
-        
-        self.df = df.reset_index(drop=True)
-        self.window_size = window_size
+class JaxForexEnv:
+    def __init__(self, data_matrix: jnp.ndarray, initial_balance: float = 1000.0, spread: float = 0.0001, window_size: int = 60):
+        self.data_matrix = data_matrix
         self.initial_balance = initial_balance
         self.spread = spread
+        self.window_size = window_size
+        self.num_features = self.data_matrix.shape[1]
+        self.max_steps = self.data_matrix.shape[0] - 1
+
+    def reset(self) -> Tuple[jnp.ndarray, EnvState]:
+        state = EnvState(
+            current_step=jnp.array(self.window_size, dtype=jnp.int32),
+            balance=jnp.array(self.initial_balance, dtype=jnp.float32),
+            net_worth=jnp.array(self.initial_balance, dtype=jnp.float32),
+            max_net_worth=jnp.array(self.initial_balance, dtype=jnp.float32),
+            position=jnp.array(0, dtype=jnp.int32),
+            entry_price=jnp.array(0.0, dtype=jnp.float32),
+            units=jnp.array(0.0, dtype=jnp.float32)
+        )
+        return self._get_obs(state), state
+
+    def _get_obs(self, state: EnvState) -> jnp.ndarray:
+        start_idx = state.current_step - self.window_size
+        window = jax.lax.dynamic_slice(self.data_matrix, (start_idx, 0), (self.window_size, self.num_features))
+        window_flat = window.flatten()
+
+        current_price = self.data_matrix[state.current_step, 0]
         
-        # Determine features size
-        # Assuming df contains 'close' and other technical indicators
-        # State = [window_size, num_features] + [balance, position, unrealized_pnl]
-        self.num_features = len(self.df.columns)
+        unrealized_pnl_long = (current_price - state.entry_price) * state.units
+        unrealized_pnl_short = (state.entry_price - current_price) * state.units
         
-        # Action space: 0: Hold, 1: Buy, 2: Sell, 3: Close
-        self.action_space = spaces.Discrete(4)
+        unrealized_pnl = jnp.where(
+            state.position == 1, unrealized_pnl_long,
+            jnp.where(state.position == -1, unrealized_pnl_short, 0.0)
+        )
+
+        account_state = jnp.array([
+            state.balance / self.initial_balance,
+            state.position.astype(jnp.float32),
+            unrealized_pnl / self.initial_balance
+        ], dtype=jnp.float32)
+
+        return jnp.concatenate((window_flat, account_state))
+
+    def step(self, state: EnvState, action: jnp.ndarray) -> Tuple[jnp.ndarray, EnvState, jnp.ndarray, jnp.ndarray, Dict]:
+        next_step = state.current_step + 1
+        done = next_step >= self.max_steps
+
+        current_price = self.data_matrix[state.current_step, 0]
+        prev_price = self.data_matrix[state.current_step - 1, 0]
+
+        step_pnl_long = (current_price - prev_price) * state.units
+        step_pnl_short = (prev_price - current_price) * state.units
+        step_pnl = jnp.where(state.position == 1, step_pnl_long, jnp.where(state.position == -1, step_pnl_short, 0.0))
         
-        # Observation space: 
-        # A 1D array flattened from the window, plus 3 account variables
-        obs_dim = (self.window_size * self.num_features) + 3
-        self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
+        new_net_worth = state.net_worth + step_pnl
+
+        trade_penalty = jnp.array(0.0, dtype=jnp.float32)
+        new_balance = state.balance
+        new_position = state.position
+        new_entry_price = state.entry_price
+        new_units = state.units
+
+        close_long_pnl = (current_price - state.entry_price) * state.units
+        close_short_pnl = (state.entry_price - current_price) * state.units
+
+        def do_buy(args):
+            b, p, ep, u, tp = args
+            b = jnp.where(p == -1, b + close_short_pnl, b)
+            p = 1
+            ep = current_price + (self.spread / 2)
+            u = (b * 0.02) / (ep * 0.01)
+            tp = -(self.spread * u)
+            return b, p, ep, u, tp
+
+        def do_sell(args):
+            b, p, ep, u, tp = args
+            b = jnp.where(p == 1, b + close_long_pnl, b)
+            p = -1
+            ep = current_price - (self.spread / 2)
+            u = (b * 0.02) / (ep * 0.01)
+            tp = -(self.spread * u)
+            return b, p, ep, u, tp
+
+        def do_close(args):
+            b, p, ep, u, tp = args
+            b = jnp.where(p == 1, b + close_long_pnl, jnp.where(p == -1, b + close_short_pnl, b))
+            p = 0
+            ep = 0.0
+            u = 0.0
+            return b, p, ep, u, tp
+
+        def do_hold(args):
+            return args
+
+        args = (new_balance, new_position, new_entry_price, new_units, trade_penalty)
+        args = jax.lax.switch(action, [do_hold, do_buy, do_sell, do_close], args)
+        new_balance, new_position, new_entry_price, new_units, trade_penalty = args
+
+        new_max_net_worth = jnp.maximum(state.max_net_worth, new_net_worth)
+
+        reward = step_pnl + trade_penalty
+        
+        drawdown = (new_max_net_worth - new_net_worth) / new_max_net_worth
+        reward = jnp.where(drawdown > 0.10, reward - (drawdown * 10), reward)
+        
+        ruin = new_net_worth <= (self.initial_balance * 0.5)
+        reward = jnp.where(ruin, reward - 1000.0, reward)
+        done = jnp.logical_or(done, ruin)
+        
+        reward = reward / self.initial_balance
+
+        new_state = EnvState(
+            current_step=next_step,
+            balance=new_balance,
+            net_worth=new_net_worth,
+            max_net_worth=new_max_net_worth,
+            position=new_position,
+            entry_price=new_entry_price,
+            units=new_units
         )
         
-        # Environment state variables
-        self.current_step = 0
-        self.balance = self.initial_balance
-        self.net_worth = self.initial_balance
-        self.max_net_worth = self.initial_balance
-        self.position = 0 # 1 = Long, -1 = Short, 0 = Flat
-        self.entry_price = 0.0
-        self.units = 0.0
-        self.history = []
+        obs = self._get_obs(new_state)
+        info = {"net_worth": new_net_worth, "drawdown": drawdown, "position": new_position}
 
-    def reset(self, seed=None, options=None):
-        super().reset(seed=seed)
-        self.balance = self.initial_balance
-        self.net_worth = self.initial_balance
-        self.max_net_worth = self.initial_balance
-        self.position = 0
-        self.entry_price = 0.0
-        self.units = 0.0
-        self.current_step = self.window_size
-        self.history = []
-        return self._get_observation(), {}
-
-    def _get_observation(self):
-        # Slice the current window of features
-        window = self.df.iloc[self.current_step - self.window_size : self.current_step].values
-        window_flat = window.flatten()
-        
-        # Account state
-        unrealized_pnl = 0.0
-        if self.position != 0:
-            current_price = self.df.loc[self.current_step, 'close']
-            if self.position == 1:
-                unrealized_pnl = (current_price - self.entry_price) * self.units
-            elif self.position == -1:
-                unrealized_pnl = (self.entry_price - current_price) * self.units
-                
-        account_state = np.array([
-            self.balance / self.initial_balance,  # normalized balance
-            float(self.position), 
-            unrealized_pnl / self.initial_balance # normalized PnL
-        ], dtype=np.float32)
-        
-        return np.concatenate((window_flat, account_state))
-
-    @staticmethod
-    def get_live_observation(features_df: pd.DataFrame, window_size: int, balance: float, initial_balance: float, position: int, unrealized_pnl: float) -> np.ndarray:
-        """Helper to generate a live observation for the RL Agent's predict() method during live trading."""
-        # Ensure we have enough data
-        if len(features_df) < window_size:
-            # Pad with zeros if we don't have enough history
-            window = np.zeros((window_size, len(features_df.columns)), dtype=np.float32)
-            window[-len(features_df):] = features_df.values
-        else:
-            window = features_df.iloc[-window_size:].values
-            
-        window_flat = window.flatten()
-        account_state = np.array([
-            balance / initial_balance,
-            float(position),
-            unrealized_pnl / initial_balance
-        ], dtype=np.float32)
-        
-        return np.concatenate((window_flat, account_state))
-
-    def step(self, action):
-        self.current_step += 1
-        
-        if self.current_step >= len(self.df) - 1:
-            return self._get_observation(), 0.0, True, False, {"msg": "End of data"}
-            
-        current_price = self.df.loc[self.current_step, 'close']
-        reward = 0.0
-        done = False
-        
-        # Calculate intermediate PnL for holding
-        step_pnl = 0.0
-        if self.position == 1:
-            step_pnl = (current_price - self.df.loc[self.current_step - 1, 'close']) * self.units
-        elif self.position == -1:
-            step_pnl = (self.df.loc[self.current_step - 1, 'close'] - current_price) * self.units
-            
-        self.net_worth += step_pnl
-        
-        # Execute Action
-        trade_penalty = 0.0
-        
-        if action == 1: # Buy
-            if self.position <= 0:
-                # Close short if exists
-                if self.position == -1:
-                    trade_pnl = (self.entry_price - current_price) * self.units
-                    self.balance += trade_pnl
-                # Open Long
-                self.position = 1
-                self.entry_price = current_price + (self.spread / 2)
-                # Fixed risk sizing for simulation (e.g. risk 2% of balance)
-                self.units = (self.balance * 0.02) / (self.entry_price * 0.01) # simple synthetic leverage
-                trade_penalty = - (self.spread * self.units) # spread cost
-                
-        elif action == 2: # Sell
-            if self.position >= 0:
-                # Close long if exists
-                if self.position == 1:
-                    trade_pnl = (current_price - self.entry_price) * self.units
-                    self.balance += trade_pnl
-                # Open Short
-                self.position = -1
-                self.entry_price = current_price - (self.spread / 2)
-                self.units = (self.balance * 0.02) / (self.entry_price * 0.01)
-                trade_penalty = - (self.spread * self.units)
-                
-        elif action == 3: # Close
-            if self.position == 1:
-                trade_pnl = (current_price - self.entry_price) * self.units
-                self.balance += trade_pnl
-            elif self.position == -1:
-                trade_pnl = (self.entry_price - current_price) * self.units
-                self.balance += trade_pnl
-            self.position = 0
-            self.units = 0.0
-
-        # Update Net Worth
-        if self.net_worth > self.max_net_worth:
-            self.max_net_worth = self.net_worth
-            
-        # ── REWARD SHAPING ──
-        # 1. Base step reward is the step PnL
-        reward = step_pnl 
-        
-        # 2. Add transaction costs
-        reward += trade_penalty
-        
-        # 3. Drawdown punishment
-        drawdown = (self.max_net_worth - self.net_worth) / self.max_net_worth
-        if drawdown > 0.10:
-            reward -= (drawdown * 10) # Heavy penalty for >10% DD
-            
-        # 4. Ruin condition
-        if self.net_worth <= self.initial_balance * 0.5:
-            reward -= 1000.0 # Game over penalty
-            done = True
-            
-        # Normalize reward for PPO stability
-        reward = reward / self.initial_balance 
-            
-        obs = self._get_observation()
-        info = {
-            "net_worth": self.net_worth,
-            "drawdown": drawdown,
-            "position": self.position
-        }
-        
-        return obs, reward, done, False, info
+        return obs, new_state, reward, done, info
