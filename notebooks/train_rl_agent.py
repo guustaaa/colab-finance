@@ -1,5 +1,13 @@
 import os
+import sys
 import logging
+
+# Dynamically add the repository root to the Python path
+repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if repo_root not in sys.path:
+    sys.path.append(repo_root)
+
+# Now Python can find 'src'
 from src.data_fetcher import CapitalFetcher
 from src.rl_agent import RLAgent
 
