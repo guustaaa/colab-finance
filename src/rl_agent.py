@@ -2,7 +2,6 @@ import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
-# 🛑 Fixes the "Unable to initialize backend 'tpu'" warning
 os.environ["JAX_PLATFORMS"] = "cuda,cpu" 
 
 import jax
@@ -20,40 +19,45 @@ from src.environment import JaxForexEnv
 logger = logging.getLogger("rl_agent")
 
 # =====================================================================
-# 🧠 HYBRID PST-TRADER ARCHITECTURE (PPO + SAC + TD3)
+# 🧠 HYBRID PST-TRADER ARCHITECTURE (Actor-Critic + SAC + TD3)
 # =====================================================================
 
 class Actor(nn.Module):
     action_dim: int
     @nn.compact
     def __call__(self, x):
-        # MASSIVE RAM UTILIZATION: 1024-width layers
-        x = nn.Dense(1024)(x)
+        # 🛡️ Orthogonal Init prevents initial activation explosions
+        init_fn = nn.initializers.orthogonal(np.sqrt(2))
+        
+        x = nn.Dense(1024, kernel_init=init_fn)(x)
         x = nn.tanh(x)
-        x = nn.Dense(1024)(x)
+        x = nn.Dense(1024, kernel_init=init_fn)(x)
         x = nn.tanh(x)
-        x = nn.Dense(512)(x)
+        x = nn.Dense(512, kernel_init=init_fn)(x)
         x = nn.tanh(x)
-        logits = nn.Dense(self.action_dim)(x)
+        
+        # Scale down final layer so initial actions are completely random (high entropy)
+        logits = nn.Dense(self.action_dim, kernel_init=nn.initializers.orthogonal(0.01))(x)
         return logits
 
 class TwinCritic(nn.Module):
     @nn.compact
     def __call__(self, x):
-        # 🛡️ TD3 ELEMENT: Twin Critics to prevent Overestimation Bias
+        init_fn = nn.initializers.orthogonal(np.sqrt(2))
+        
         # Critic 1
-        c1 = nn.Dense(1024)(x)
+        c1 = nn.Dense(1024, kernel_init=init_fn)(x)
         c1 = nn.relu(c1)
-        c1 = nn.Dense(512)(c1)
+        c1 = nn.Dense(512, kernel_init=init_fn)(c1)
         c1 = nn.relu(c1)
-        v1 = nn.Dense(1)(c1)
+        v1 = nn.Dense(1, kernel_init=nn.initializers.orthogonal(1.0))(c1)
         
         # Critic 2
-        c2 = nn.Dense(1024)(x)
+        c2 = nn.Dense(1024, kernel_init=init_fn)(x)
         c2 = nn.relu(c2)
-        c2 = nn.Dense(512)(c2)
+        c2 = nn.Dense(512, kernel_init=init_fn)(c2)
         c2 = nn.relu(c2)
-        v2 = nn.Dense(1)(c2)
+        v2 = nn.Dense(1, kernel_init=nn.initializers.orthogonal(1.0))(c2)
         
         return jnp.squeeze(v1, axis=-1), jnp.squeeze(v2, axis=-1)
 
@@ -69,12 +73,11 @@ class HybridNetwork(nn.Module):
         return logits, v1, v2
 
 class RLAgent:
-    def __init__(self, model_path: str = "/kaggle/working/ForexAI_State/models/rl_hybrid_agent.pkl", device: str = "auto"):
+    def __init__(self, model_path: str = "/kaggle/working/ForexAI_State/models/rl_pst_trader_v3.pkl", device: str = "auto"):
         self.model_path = model_path
         self.action_dim = 4
         self.network = HybridNetwork(action_dim=self.action_dim)
         
-        # 🛡️ PPO ELEMENT: Trust Region Optimizer
         self.optimizer = optax.chain(
             optax.clip_by_global_norm(0.5),
             optax.adam(learning_rate=1e-4)
@@ -108,28 +111,28 @@ class RLAgent:
         replicated_opt_state = jax.tree.map(lambda x: jnp.stack([x] * num_devices), opt_state)
 
         # ---------------------------------------------------------
-        # THE HYBRID LOSS FUNCTION (PPO + SAC + TD3)
+        # HYBRID LOSS FUNCTION (WITH HUBER SHOCK ABSORBERS)
         # ---------------------------------------------------------
-        def hybrid_loss(params, obs, actions, advantages, returns, old_log_probs):
-            # 🛠️ FIX: Call the main network apply function directly
+        def huber_loss(x, delta=1.0):
+            return jnp.where(jnp.abs(x) < delta, 0.5 * x**2, delta * (jnp.abs(x) - 0.5 * delta))
+
+        def hybrid_loss(params, obs, actions, norm_advantages, target_v):
             logits, v1, v2 = self.network.apply(params, obs)
             
             log_probs = jax.nn.log_softmax(logits)
             action_log_probs = jnp.take_along_axis(log_probs, actions[:, None], axis=-1).squeeze(-1)
             
-            # 1. PPO Policy Update
-            ratio = jnp.exp(action_log_probs - old_log_probs)
-            clip_adv = jnp.clip(ratio, 0.8, 1.2) * advantages
-            loss_actor = -jnp.mean(jnp.minimum(ratio * advantages, clip_adv))
+            # 1. Actor Loss (Policy Gradient with normalized advantages)
+            loss_actor = -jnp.mean(action_log_probs * norm_advantages)
             
-            # 2. TD3 Twin Critic Update
-            loss_critic1 = 0.5 * jnp.mean((returns - v1) ** 2)
-            loss_critic2 = 0.5 * jnp.mean((returns - v2) ** 2)
+            # 2. TD3 Critic Update (Huber Loss prevents squaring explosions)
+            loss_critic1 = jnp.mean(huber_loss(v1 - target_v))
+            loss_critic2 = jnp.mean(huber_loss(v2 - target_v))
             loss_critic = loss_critic1 + loss_critic2
             
-            # 3. SAC Soft-Entropy Maximization (Forces aggressive exploration)
+            # 3. SAC Soft-Entropy Maximization
             entropy = -jnp.mean(jnp.sum(jax.nn.softmax(logits) * log_probs, axis=-1))
-            sac_alpha = 0.05 # SAC Temperature
+            sac_alpha = 0.05 
             
             total_loss = loss_actor + (0.5 * loss_critic) - (sac_alpha * entropy)
             return total_loss
@@ -140,25 +143,35 @@ class RLAgent:
                 params, opt_state, rng, states, obs = carry
                 rng, step_rng = jax.random.split(rng)
                 
-                # Forward Pass
+                # 1. Forward Pass (Current State)
                 logits, v1, v2 = self.network.apply(params, obs)
-                
-                # 🛡️ TD3 ELEMENT: Pessimistic Bound Calculation
-                v_pessimistic = jnp.minimum(v1, v2)
+                v_curr = jnp.minimum(v1, v2)
                 
                 actions = jax.random.categorical(step_rng, logits)
-                log_probs = jnp.take_along_axis(jax.nn.log_softmax(logits), actions[:, None], axis=-1).squeeze(-1)
                 
-                # Step parallel worlds
+                # 2. Step parallel worlds
                 next_obs, next_states, rewards, dones, infos = jax.vmap(env.step)(states, actions)
                 
-                # Calculate Advantage using the Pessimistic Bound
-                advantages = rewards - v_pessimistic
-                returns = rewards + 0.99 * v_pessimistic
+                # 3. Forward Pass (Next State) - purely to calculate the target
+                _, next_v1, next_v2 = self.network.apply(params, next_obs)
+                v_next = jnp.minimum(next_v1, next_v2)
                 
-                # Backprop
+                # 🛡️ THE SHIELD: Bellman Target with Stop-Gradient
+                # This breaks the infinite mathematical feedback loop
+                target_v = rewards + 0.99 * v_next * (1.0 - dones)
+                target_v = jax.lax.stop_gradient(target_v)
+                
+                advantages = target_v - v_curr
+                advantages = jax.lax.stop_gradient(advantages)
+                
+                # 🛡️ Advantage Normalization (Pins gradients inside a safe bell curve)
+                adv_mean = jnp.mean(advantages)
+                adv_std = jnp.std(advantages) + 1e-8
+                norm_advantages = (advantages - adv_mean) / adv_std
+                
+                # 4. Backprop
                 grad_fn = jax.value_and_grad(hybrid_loss)
-                loss, grads = grad_fn(params, obs, actions, advantages, returns, log_probs)
+                loss, grads = grad_fn(params, obs, actions, norm_advantages, target_v)
                 grads = jax.lax.pmean(grads, axis_name='p')
                 updates, opt_state = self.optimizer.update(grads, opt_state)
                 params = optax.apply_updates(params, updates)
@@ -187,6 +200,7 @@ class RLAgent:
         obs = get_obs_pmap(states)
 
         logger.info(f"🚀 PST-TRADER IGNITION: Ram Overdrive Mode Enabled.")
+        logger.info(f"🛡️ Math Shields Online: Bellman Freezing, Huber Loss, Orthogonal Vectors.")
         start_time = time.time()
         
         epoch = 0
@@ -198,9 +212,9 @@ class RLAgent:
             current_loss = jnp.mean(loss_mean)
             current_reward = jnp.mean(reward_mean)
 
-            # Auto-Recovery
+            # Failsafe Auto-Recovery
             if current_loss > 1000.0 or jnp.isnan(current_loss):
-                logger.error("🚨 MATH EXPLOSION DETECTED. Reverting to safe checkpoint...")
+                logger.error(f"🚨 Anomalous Loss Detected ({current_loss}). Reverting to safe checkpoint...")
                 if self.load():
                     replicated_params = jax.tree.map(lambda x: jnp.stack([x] * num_devices), self.params)
                     opt_state = self.optimizer.init(self.params)
@@ -245,3 +259,10 @@ class RLAgent:
                 self.params = pickle.load(f)
             return True
         return False
+
+    def predict(self, obs: np.ndarray) -> int:
+        if self.params is None:
+            return 0
+        obs_jnp = jnp.array(obs, dtype=jnp.float32)
+        logits, _, _ = self.network.apply(self.params, obs_jnp)
+        return int(jnp.argmax(logits))
