@@ -19,45 +19,48 @@ from src.environment import JaxForexEnv
 logger = logging.getLogger("rl_agent")
 
 # =====================================================================
-# 🧠 TRUE DECOUPLED PST-TRADER (LayerNorm + PPO + SAC + TD3)
+# 🧠 PST-TRADER WITH MIXED-PRECISION & CONTINUOUS STREAMING
 # =====================================================================
 
 class Actor(nn.Module):
     action_dim: int
     @nn.compact
     def __call__(self, x):
-        # 🛡️ FATAL FLAW FIXED: Normalize wildly different Forex pairs!
         x = nn.LayerNorm()(x)
         
+        # 🔬 RESEARCH FINDING 3: Mixed-Precision Execution (bfloat16)
+        x = jnp.asarray(x, dtype=jnp.bfloat16)
         init_fn = nn.initializers.orthogonal(np.sqrt(2))
-        x = nn.Dense(512, kernel_init=init_fn)(x)
+        
+        x = nn.Dense(512, dtype=jnp.bfloat16, kernel_init=init_fn)(x)
         x = nn.tanh(x)
-        x = nn.Dense(512, kernel_init=init_fn)(x)
+        x = nn.Dense(512, dtype=jnp.bfloat16, kernel_init=init_fn)(x)
         x = nn.tanh(x)
         
-        # Scale down final layer for high initial exploration
-        logits = nn.Dense(self.action_dim, kernel_init=nn.initializers.orthogonal(0.01))(x)
+        # Cast back to float32 for stable probability calculations
+        logits = nn.Dense(self.action_dim, dtype=jnp.float32, kernel_init=nn.initializers.orthogonal(0.01))(x)
         return logits
 
 class TwinCritic(nn.Module):
     @nn.compact
     def __call__(self, x):
         x = nn.LayerNorm()(x)
+        x = jnp.asarray(x, dtype=jnp.bfloat16)
         init_fn = nn.initializers.orthogonal(np.sqrt(2))
         
-        # Critic 1
-        c1 = nn.Dense(512, kernel_init=init_fn)(x)
+        # Critic 1 (bfloat16)
+        c1 = nn.Dense(512, dtype=jnp.bfloat16, kernel_init=init_fn)(x)
         c1 = nn.relu(c1)
-        c1 = nn.Dense(512, kernel_init=init_fn)(c1)
+        c1 = nn.Dense(512, dtype=jnp.bfloat16, kernel_init=init_fn)(c1)
         c1 = nn.relu(c1)
-        v1 = nn.Dense(1, kernel_init=nn.initializers.orthogonal(1.0))(c1)
+        v1 = nn.Dense(1, dtype=jnp.float32, kernel_init=nn.initializers.orthogonal(1.0))(c1)
         
-        # Critic 2
-        c2 = nn.Dense(512, kernel_init=init_fn)(x)
+        # Critic 2 (bfloat16)
+        c2 = nn.Dense(512, dtype=jnp.bfloat16, kernel_init=init_fn)(x)
         c2 = nn.relu(c2)
-        c2 = nn.Dense(512, kernel_init=init_fn)(c2)
+        c2 = nn.Dense(512, dtype=jnp.bfloat16, kernel_init=init_fn)(c2)
         c2 = nn.relu(c2)
-        v2 = nn.Dense(1, kernel_init=nn.initializers.orthogonal(1.0))(c2)
+        v2 = nn.Dense(1, dtype=jnp.float32, kernel_init=nn.initializers.orthogonal(1.0))(c2)
         
         return jnp.squeeze(v1, axis=-1), jnp.squeeze(v2, axis=-1)
 
@@ -78,7 +81,7 @@ class RLAgent:
         self.action_dim = 4
         self.network = HybridNetwork(action_dim=self.action_dim)
         
-        # Hard Trust Region bounds
+        # Math Shield weights
         self.optimizer = optax.chain(
             optax.clip_by_global_norm(0.5),
             optax.adam(learning_rate=3e-4)
@@ -86,7 +89,6 @@ class RLAgent:
         self.params = None
         
     def train(self, data_dict: dict, total_timesteps: int = 500_000_000):
-        # Memory-Optimized Batching for T4 GPUs
         N_ENVS = 16384
         CHUNK_SIZE = 500
         
@@ -99,7 +101,9 @@ class RLAgent:
         logger.info(f"⚙️ Compute Engine: {num_devices}x GPU | Matrix Size: {N_ENVS}x{CHUNK_SIZE}")
         
         rng = jax.random.PRNGKey(42)
+        # 🐛 THE FIX: Correctly split PRNGKeys into an array matching num_devices
         rng, init_rng = jax.random.split(rng)
+        step_rngs = jax.random.split(rng, num_devices) 
         
         dummy_obs, _ = env.reset()
         self.params = self.network.init(init_rng, dummy_obs)
@@ -114,29 +118,49 @@ class RLAgent:
         def huber_loss(x, delta=1.0):
             return jnp.where(jnp.abs(x) < delta, 0.5 * x**2, delta * (jnp.abs(x) - 0.5 * delta))
 
-        # ---------------------------------------------------------
-        # TRUE DECOUPLED PPO ENGINE
-        # ---------------------------------------------------------
         @partial(jax.pmap, axis_name='p')
-        def process_chunk(params, opt_state, rng, states, obs):
+        def process_chunk(params, opt_state, step_rngs_mapped, states, obs):
             
-            # PHASE 1: ROLLOUT (Collect trajectories without changing weights)
+            # PHASE 1: CONTINUOUS STREAM ROLLOUT
             def rollout_step(carry, unused):
-                rng, states, obs = carry
-                rng, step_rng = jax.random.split(rng)
+                carry_rng, current_states, current_obs = carry
+                carry_rng, step_rng = jax.random.split(carry_rng)
                 
-                logits, v1, v2 = self.network.apply(params, obs)
+                logits, v1, v2 = self.network.apply(params, current_obs)
                 v_curr = jnp.minimum(v1, v2)
                 
                 actions = jax.random.categorical(step_rng, logits)
                 log_probs = jnp.take_along_axis(jax.nn.log_softmax(logits), actions[:, None], axis=-1).squeeze(-1)
                 
-                next_obs, next_states, rewards, dones, infos = jax.vmap(env.step)(states, actions)
+                next_obs, next_states, rewards, dones, infos = jax.vmap(env.step)(current_states, actions)
                 
-                transition = (obs, actions, log_probs, rewards, v_curr, dones)
-                return (rng, next_states, next_obs), transition
+                # 🔬 RESEARCH FINDING 2: Iterable Pipeline / Continuous Stream
+                # Auto-reset environments that hit "done" to a random historical point
+                def single_reset(s, k):
+                    rs = jax.random.randint(k, (), minval=env.window_size, maxval=env.max_steps - 1000)
+                    return s.replace(
+                        current_step=rs,
+                        balance=jnp.array(env.initial_balance, dtype=jnp.float32),
+                        net_worth=jnp.array(env.initial_balance, dtype=jnp.float32),
+                        max_net_worth=jnp.array(env.initial_balance, dtype=jnp.float32),
+                        position=jnp.array(0, dtype=jnp.int32),
+                        entry_price=jnp.array(0.0, dtype=jnp.float32),
+                        units=jnp.array(0.0, dtype=jnp.float32)
+                    )
+                
+                reset_keys = jax.random.split(step_rng, dones.shape[0])
+                reset_states_batch = jax.vmap(single_reset)(next_states, reset_keys)
+                
+                # Inject reset states over done states
+                next_states = jax.tree.map(lambda r, n: jnp.where(dones, r, n), reset_states_batch, next_states)
+                next_obs = jax.vmap(env._get_obs)(next_states)
+                
+                transition = (current_obs, actions, log_probs, rewards, v_curr, dones)
+                return (carry_rng, next_states, next_obs), transition
 
-            (rng, states, next_obs), trajectories = jax.lax.scan(rollout_step, (rng, states, obs), None, length=CHUNK_SIZE)
+            (step_rngs_mapped, states, next_obs), trajectories = jax.lax.scan(
+                rollout_step, (step_rngs_mapped, states, obs), None, length=CHUNK_SIZE
+            )
             obs_batch, actions_batch, log_probs_batch, rewards_batch, values_batch, dones_batch = trajectories
             
             # PHASE 2: REVERSE BELLMAN ESTIMATION
@@ -155,21 +179,33 @@ class RLAgent:
             adv_std = jnp.std(advantages_batch) + 1e-8
             norm_advantages_batch = (advantages_batch - adv_mean) / adv_std
             
-            # PHASE 3: NETWORK UPDATE (With active PPO Clipping)
+            # 🔬 RESEARCH FINDING 1: Random Reshuffling
+            # Flatten arrays and randomly shuffle indices to stabilize training
+            step_rngs_mapped, shuffle_rng = jax.random.split(step_rngs_mapped)
+            flat_size = CHUNK_SIZE * (N_ENVS // jax.local_device_count())
+            indices = jax.random.permutation(shuffle_rng, flat_size)
+            
+            def flatten_and_shuffle(x):
+                return x.reshape(flat_size, -1).squeeze()[indices]
+            
+            f_obs = flatten_and_shuffle(obs_batch)
+            f_actions = flatten_and_shuffle(actions_batch)
+            f_log_probs = flatten_and_shuffle(log_probs_batch)
+            f_returns = flatten_and_shuffle(returns_batch)
+            f_advs = flatten_and_shuffle(norm_advantages_batch)
+            
+            # PHASE 3: SHUFFLED NETWORK UPDATE
             def loss_fn(params_to_update):
-                # Apply network to the entire batch of historical states
-                logits, v1, v2 = self.network.apply(params_to_update, obs_batch)
+                logits, v1, v2 = self.network.apply(params_to_update, f_obs)
                 
                 new_log_probs_full = jax.nn.log_softmax(logits)
-                new_log_probs = jnp.take_along_axis(new_log_probs_full, actions_batch[..., None], axis=-1).squeeze(-1)
+                new_log_probs = jnp.take_along_axis(new_log_probs_full, f_actions[..., None], axis=-1).squeeze(-1)
                 
-                # 🛡️ THIS IS TRUE PPO CLIPPING: It now correctly compares New vs Old
-                ratio = jnp.exp(new_log_probs - log_probs_batch)
-                clip_adv = jnp.clip(ratio, 0.8, 1.2) * norm_advantages_batch
-                loss_actor = -jnp.mean(jnp.minimum(ratio * norm_advantages_batch, clip_adv))
+                ratio = jnp.exp(new_log_probs - f_log_probs)
+                clip_adv = jnp.clip(ratio, 0.8, 1.2) * f_advs
+                loss_actor = -jnp.mean(jnp.minimum(ratio * f_advs, clip_adv))
                 
-                loss_critic = 0.5 * jnp.mean(huber_loss(v1 - returns_batch)) + 0.5 * jnp.mean(huber_loss(v2 - returns_batch))
-                
+                loss_critic = 0.5 * jnp.mean(huber_loss(v1 - f_returns)) + 0.5 * jnp.mean(huber_loss(v2 - f_returns))
                 entropy = -jnp.mean(jnp.sum(jax.nn.softmax(logits) * new_log_probs_full, axis=-1))
                 
                 return loss_actor + 0.5 * loss_critic - 0.05 * entropy
@@ -180,7 +216,7 @@ class RLAgent:
             updates, opt_state = self.optimizer.update(grads, opt_state)
             params = optax.apply_updates(params, updates)
             
-            return params, opt_state, rng, states, next_obs, loss, jnp.mean(rewards_batch)
+            return params, opt_state, step_rngs_mapped, states, next_obs, loss, jnp.mean(rewards_batch)
         
         steps_per_epoch = N_ENVS * CHUNK_SIZE
         state_keys = jax.random.split(rng, num_devices)
@@ -197,13 +233,14 @@ class RLAgent:
         states = init_envs(state_keys)
         obs = get_obs_pmap(states)
 
-        logger.info(f"🚀 TRUE DECOUPLED PPO ENGINE ONLINE.")
+        logger.info(f"🚀 OPTIMIZED DECOUPLED PPO ENGINE ONLINE.")
         start_time = time.time()
         
         epoch = 0
         while True:
-            replicated_params, replicated_opt_state, rng, states, obs, loss_mean, reward_mean = process_chunk(
-                replicated_params, replicated_opt_state, rng, states, obs
+            # Pass step_rngs (which is properly mapped) into process_chunk
+            replicated_params, replicated_opt_state, step_rngs, states, obs, loss_mean, reward_mean = process_chunk(
+                replicated_params, replicated_opt_state, step_rngs, states, obs
             )
 
             current_loss = jnp.mean(loss_mean)
