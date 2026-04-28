@@ -33,7 +33,7 @@ def main():
         logger.error(f"🚨 Failed to load Kaggle secrets: {e}. Are they attached to this notebook?")
         return
 
-    # Initialize the fetcher (it will now successfully find the credentials in os.environ)
+    # Initialize the fetcher
     fetcher = CapitalFetcher()
     
     # 1. Fetch data for MULTIPLE pairs
@@ -41,7 +41,6 @@ def main():
     data_dict = {}
     
     for pair in target_pairs:
-
         logger.info(f"Fetching max history for {pair}...")
         
         # Fetch the bulk historical data
@@ -58,17 +57,16 @@ def main():
         logger.error("🚨 No data was fetched across any currency pairs. Exiting.")
         return
 
-    logger.info("🧠 Spawning Matrix Environments and Initializing PPO...")
+    logger.info("🧠 Spawning Hybrid PST-Trader Matrix Environments...")
     
-    # Point the agent to where you want the weights saved
+    # Ensure it's looking for the new hybrid model file
     agent = RLAgent(model_path="/kaggle/working/ForexAI_State/models/rl_hybrid_agent.pkl")
     
     # 2. PUSH THE T4 GPUs TO MAXIMUM CAPACITY
+    # Note: n_envs and batch_size are now hardcoded in the agent for max VRAM usage
     agent.train(
         data_dict=data_dict,
-        total_timesteps=50_000_000,  # 50 Million micro-decisions
-        n_envs=4096,                 # 4,096 Parallel universes simulated at once
-        batch_size=8192              # Massive batches to saturate the 2x T4s
+        total_timesteps=500_000_000
     )
 
 if __name__ == "__main__":
