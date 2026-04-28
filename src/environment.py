@@ -16,7 +16,6 @@ class EnvState:
     winning_trades: jnp.ndarray
 
 class JaxForexEnv:
-    # Reduced window size to 30 to save VRAM while retaining market context
     def __init__(self, data_matrix: jnp.ndarray, initial_balance: float = 1000.0, spread: float = 0.0001, window_size: int = 30):
         self.data_matrix = data_matrix
         self.initial_balance = initial_balance
@@ -44,12 +43,11 @@ class JaxForexEnv:
         window = jax.lax.dynamic_slice(self.data_matrix, (start_idx, 0), (self.window_size, self.num_features))
         window_flat = window.flatten()
 
-        # 🛡️ Z-SCORE NORMALIZATION: Prevents Math Explosions regardless of pair (JPY vs EUR)
         w_mean = jnp.mean(window_flat)
         w_std = jnp.std(window_flat) + 1e-8
         window_flat = (window_flat - w_mean) / w_std
 
-        current_price = self.data_matrix[state.current_step, 3] # Assuming index 3 is Close
+        current_price = self.data_matrix[state.current_step, 3] 
         
         unrealized_pnl_long = (current_price - state.entry_price) * state.units
         unrealized_pnl_short = (state.entry_price - current_price) * state.units
@@ -93,7 +91,7 @@ class JaxForexEnv:
             
             p = 1
             ep = current_price + (self.spread / 2)
-            u = (b * 0.02) / (ep * 0.01)
+            u = (b * 0.05) / (ep * 0.01) # Increased position sizing
             tp = -(self.spread * u)
             return b, p, ep, u, tp, tt, wt, real_pnl
 
@@ -107,7 +105,7 @@ class JaxForexEnv:
             
             p = -1
             ep = current_price - (self.spread / 2)
-            u = (b * 0.02) / (ep * 0.01)
+            u = (b * 0.05) / (ep * 0.01)
             tp = -(self.spread * u)
             return b, p, ep, u, tp, tt, wt, real_pnl
 
@@ -136,18 +134,25 @@ class JaxForexEnv:
 
         new_max_net_worth = jnp.maximum(state.max_net_worth, new_net_worth)
 
-        # ⚖️ STRICT REWARD SHAPING
-        # Amplify winning behavior, severely punish losing behavior.
+        # -------------------------------------------------------------
+        # 🛡️ DYNAMIC VOLATILITY & STRICT REWARDS (Research Point #3)
+        # -------------------------------------------------------------
+        window_closes = jax.lax.dynamic_slice(self.data_matrix, (state.current_step - self.window_size, 3), (self.window_size, 1))
+        volatility = jnp.std(window_closes) / (jnp.mean(window_closes) + 1e-8)
+
         trade_incentive = jnp.where(
             realized_pnl > 0, 
-            realized_pnl * 5.0, # Huge bonus for closing in profit
-            jnp.where(realized_pnl < 0, realized_pnl * 5.0 - (0.02 * self.initial_balance), 0.0) # Penalty for losing + flat punishment
+            realized_pnl * 20.0, # Massive multiplier for taking profit
+            jnp.where(realized_pnl < 0, (realized_pnl * 20.0) - (0.01 * self.initial_balance), 0.0) # Flat penalty for losing
         )
         
-        reward = step_pnl + trade_penalty + trade_incentive
+        base_reward = step_pnl + trade_penalty + trade_incentive
+        
+        # Scale reward by current market volatility to prevent hyper-active trading during chaos
+        reward = base_reward / (1.0 + (volatility * 100.0))
         
         drawdown = (new_max_net_worth - new_net_worth) / new_max_net_worth
-        reward = jnp.where(drawdown > 0.10, reward - (drawdown * 10), reward)
+        reward = jnp.where(drawdown > 0.10, reward - (drawdown * 20), reward)
         
         ruin = new_net_worth <= (self.initial_balance * 0.5)
         reward = jnp.where(ruin, reward - 1000.0, reward)

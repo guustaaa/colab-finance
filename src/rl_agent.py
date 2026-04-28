@@ -22,6 +22,7 @@ class Actor(nn.Module):
     action_dim: int
     @nn.compact
     def __call__(self, x):
+        x = nn.LayerNorm()(x)
         x = jnp.asarray(x, dtype=jnp.bfloat16)
         init_fn = nn.initializers.orthogonal(np.sqrt(2))
         
@@ -36,6 +37,7 @@ class Actor(nn.Module):
 class TwinCritic(nn.Module):
     @nn.compact
     def __call__(self, x):
+        x = nn.LayerNorm()(x)
         x = jnp.asarray(x, dtype=jnp.bfloat16)
         init_fn = nn.initializers.orthogonal(np.sqrt(2))
         
@@ -65,7 +67,7 @@ class HybridNetwork(nn.Module):
         return logits, v1, v2
 
 class RLAgent:
-    def __init__(self, model_path: str = "/kaggle/working/ForexAI_State/models/rl_pst_trader_v5.pkl", device: str = "auto"):
+    def __init__(self, model_path: str = "/kaggle/working/ForexAI_State/models/rl_pst_trader_v6.pkl", device: str = "auto"):
         self.model_path = model_path
         self.action_dim = 4
         self.network = HybridNetwork(action_dim=self.action_dim)
@@ -77,7 +79,6 @@ class RLAgent:
         self.params = None
         
     def train(self, data_dict: dict, total_timesteps: int = 500_000_000):
-        # 🧠 VRAM SAFETY LIMITS (Prevents 13.4GB OOM Error)
         N_ENVS = 4096       
         CHUNK_SIZE = 128    
         NUM_MINIBATCHES = 16 
@@ -99,7 +100,7 @@ class RLAgent:
         opt_state = self.optimizer.init(self.params)
         
         if self.load():
-            logger.info("Resuming from safe v5 Checkpoint...")
+            logger.info("Resuming from safe v6 Checkpoint...")
             
         replicated_params = jax.tree.map(lambda x: jnp.stack([x] * num_devices), self.params)
         replicated_opt_state = jax.tree.map(lambda x: jnp.stack([x] * num_devices), opt_state)
@@ -115,6 +116,20 @@ class RLAgent:
                 
                 logits, v1, v2 = self.network.apply(params, current_obs)
                 v_curr = jnp.minimum(v1, v2)
+                
+                # -------------------------------------------------------------
+                # 🛡️ ACTION SPACE MASKING (Research Point #5)
+                # -------------------------------------------------------------
+                # 0: Hold, 1: Buy, 2: Sell, 3: Close
+                valid_hold = jnp.ones_like(current_states.position, dtype=jnp.bool_)
+                valid_buy = current_states.position <= 0    # Can't buy if already long
+                valid_sell = current_states.position >= 0   # Can't sell if already short
+                valid_close = current_states.position != 0  # Can't close if flat
+                
+                action_mask = jnp.stack([valid_hold, valid_buy, valid_sell, valid_close], axis=-1)
+                
+                # Apply mask: Set invalid actions to negative infinity
+                logits = jnp.where(action_mask, logits, -1e9)
                 
                 actions = jax.random.categorical(step_rng, logits)
                 log_probs = jnp.take_along_axis(jax.nn.log_softmax(logits), actions[:, None], axis=-1).squeeze(-1)
@@ -234,7 +249,7 @@ class RLAgent:
         states = init_envs(state_keys)
         obs = get_obs_pmap(states)
 
-        logger.info(f"🚀 V5 DECOUPLED PPO ENGINE ONLINE (OOM-Safe).")
+        logger.info(f"🚀 V6 PST-TRADER ONLINE (Action Space Masking Enabled).")
         start_time = time.time()
         
         epoch = 0
@@ -265,7 +280,7 @@ class RLAgent:
                 win_rate = (winning_trades_count / jnp.maximum(1, total_trades_count)) * 100.0
 
                 print(f"----------------------------------------")
-                print(f"| V5 PST-TRADER METRICS   |            |")
+                print(f"| V6 MASKED PST-TRADER    |            |")
                 print(f"|    fps                  | {fps:<10} |")
                 print(f"|    total_timesteps      | {epoch * steps_per_epoch:<10} |")
                 print(f"| accuracy/               |            |")
@@ -281,7 +296,7 @@ class RLAgent:
                 os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
                 with open(self.model_path, 'wb') as f:
                     pickle.dump(self.params, f)
-                logger.info(f"💾 v5 Checkpoint Saved.")
+                logger.info(f"💾 v6 Checkpoint Saved.")
             epoch += 1
 
     def load(self):
