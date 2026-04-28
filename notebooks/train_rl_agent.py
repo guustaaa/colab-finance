@@ -1,37 +1,45 @@
 import os
-import sys
-import time
 import logging
-
-# Ensure src is in python path
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
-from src.config import INSTRUMENTS, DRIVE_MODELS_DIR, TRADING_GRANULARITY, BULK_HISTORY_YEARS
 from src.data_fetcher import CapitalFetcher
-from src.features import compute_all_features
-from src.sentiment import SentimentScanner
 from src.rl_agent import RLAgent
-from src.utils import setup_logger
 
-setup_logger("rl_trainer", "./logs")
+# Suppress TF/JAX CUDA factory warnings before any heavy JAX imports
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
+
+# Configure Logging
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(name)s | %(levelname)s | %(message)s')
 logger = logging.getLogger("rl_trainer")
-# notebooks/train_rl_agent.py
-# ... (Keep your imports and secret loading) ...
 
 def main():
+    # Initialize the fetcher to use your loaded Capital.com API secrets
+    fetcher = CapitalFetcher()
+    
     # 1. Fetch data for MULTIPLE pairs to force the network to learn generalized sentiment
     target_pairs = ["EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CHF"]
     data_dict = {}
     
-    # Assuming your fetcher is initialized here
     for pair in target_pairs:
         logger.info(f"Fetching max history for {pair}...")
-        # Replace this with your exact CapitalFetcher call
+        
+        # Fetch the bulk historical data
         df = fetcher.fetch_bulk_history(pair) 
-        data_dict[pair] = df
-        logger.info(f"✅ {pair} Features Ready: {len(df)} rows.")
+        
+        # Ensure it actually returned data before adding to our matrix
+        if df is not None and not df.empty:
+            data_dict[pair] = df
+            logger.info(f"✅ {pair} Features Ready: {len(df)} rows.")
+        else:
+            logger.warning(f"⚠️ Failed to fetch data for {pair}, skipping...")
+
+    if not data_dict:
+        logger.error("🚨 No data was fetched across any currency pairs. Exiting.")
+        return
 
     logger.info("🧠 Spawning Matrix Environments and Initializing PPO...")
+    
+    # Point the agent to where you want the weights saved
     agent = RLAgent(model_path="/kaggle/working/ForexAI_State/models/rl_ppo_agent.pkl")
     
     # 2. PUSH THE T4 GPUs TO MAXIMUM CAPACITY
