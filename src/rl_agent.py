@@ -1,4 +1,12 @@
 import os
+# Silences the TensorFlow/JAX duplicate registration warnings
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3" 
+# Prevents JAX from allocating 90% of the GPU memory on startup
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+# Allows GPU memory to grow dynamically 
+os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
+
+import os
 import logging
 import numpy as np
 from typing import List, Optional
@@ -47,7 +55,7 @@ class RLAgent:
         
         logger.info(f"Setting up {n_envs} vectorized environments...")
         # Use SubprocVecEnv for true multiprocessing on Kaggle CPUs
-        vec_env = SubprocVecEnv([self._make_env(df) for _ in range(n_envs)])
+        vec_env = SubprocVecEnv([self._make_env(df) for _ in range(n_envs)], start_method="spawn")
         
         logger.info("Initializing PPO Neural Network (Actor-Critic)...")
         self.model = PPO(
