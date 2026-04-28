@@ -2,6 +2,8 @@ import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
+# 🛑 Fixes the "Unable to initialize backend 'tpu'" warning
+os.environ["JAX_PLATFORMS"] = "cuda,cpu" 
 
 import jax
 import jax.numpy as jnp
@@ -81,7 +83,6 @@ class RLAgent:
         
     def train(self, data_dict: dict, total_timesteps: int = 500_000_000):
         # 🚀 RAM MAXIMIZATION PARAMETERS 
-        # These numbers will push 2x T4 GPUs (15GB VRAM each) to their absolute limits
         N_ENVS = 16384       # 16k parallel universes
         CHUNK_SIZE = 500     # 500 steps per universe per loop
         
@@ -110,8 +111,8 @@ class RLAgent:
         # THE HYBRID LOSS FUNCTION (PPO + SAC + TD3)
         # ---------------------------------------------------------
         def hybrid_loss(params, obs, actions, advantages, returns, old_log_probs):
-            logits = self.network.actor(params, obs)
-            v1, v2 = self.network.critic(params, obs)
+            # 🛠️ FIX: Call the main network apply function directly
+            logits, v1, v2 = self.network.apply(params, obs)
             
             log_probs = jax.nn.log_softmax(logits)
             action_log_probs = jnp.take_along_axis(log_probs, actions[:, None], axis=-1).squeeze(-1)
@@ -143,7 +144,6 @@ class RLAgent:
                 logits, v1, v2 = self.network.apply(params, obs)
                 
                 # 🛡️ TD3 ELEMENT: Pessimistic Bound Calculation
-                # We assume the WORST outcome between the two critics to prevent hallucinated trades
                 v_pessimistic = jnp.minimum(v1, v2)
                 
                 actions = jax.random.categorical(step_rng, logits)
