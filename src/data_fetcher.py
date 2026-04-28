@@ -141,7 +141,6 @@ class CapitalClient:
             )
             if resp.status_code in (200, 201):
                 result = resp.json() if resp.text else {}
-                # Also capture dealReference from response
                 result["_status_code"] = resp.status_code
                 result["_headers"] = dict(resp.headers)
                 return result
@@ -207,7 +206,6 @@ class CapitalFetcher:
             for acc in data["accounts"]:
                 if acc.get("preferred", False):
                     return acc.get("balance", {}).get("balance", 0.0)
-            # Fallback to first account
             if data["accounts"]:
                 return data["accounts"][0].get("balance", {}).get("balance", 0.0)
         return None
@@ -263,58 +261,126 @@ class CapitalFetcher:
         logger.info(f"Fetched {len(df)} candles for {instrument}")
         return df if not df.empty else None
 
-    def fetch_bulk_history(self, epic: str) -> pd.DataFrame:
-        import os
+    def fetch_bulk_history(
+        self,
+        instrument: str,
+        years: float = 2.0,
+        granularity: str = "H1",
+        cache_path: str | None = None,
+    ) -> pd.DataFrame | None:
+        """
+        Paginate backwards to collect up to `years` of history.
+        Contains Smart Cache Breaker logic.
+        """
+        import time as _time
         import pandas as pd
-        
+
+        # Override with explicit Kaggle local cache location
         cache_dir = "/kaggle/working/ForexAI_State/data_cache"
         os.makedirs(cache_dir, exist_ok=True)
-        cache_path = os.path.join(cache_dir, f"{epic}_history.csv")
+        epic = self.client.to_epic(instrument)
+        csv_cache_path = os.path.join(cache_dir, f"{epic}_history.csv")
         
         cached_df = pd.DataFrame()
         last_cached_date = None
         
         # 1. Load Local Cache
-        if os.path.exists(cache_path):
-            cached_df = pd.read_csv(cache_path)
-            cached_df['timestamp'] = pd.to_datetime(cached_df['timestamp'])
-            cached_df = cached_df.sort_values('timestamp').reset_index(drop=True)
-            
-            if not cached_df.empty:
-                last_cached_date = cached_df['timestamp'].iloc[-1]
-                logger.info(f"[{epic}] 📦 Cache found! Contains {len(cached_df)} rows. Fetching only NEW data since {last_cached_date.strftime('%Y-%m-%d')}")
+        if os.path.exists(csv_cache_path):
+            try:
+                cached_df = pd.read_csv(csv_cache_path)
+                cached_df['time'] = pd.to_datetime(cached_df['time'], utc=True)
+                cached_df = cached_df.sort_values('time').reset_index(drop=True)
+                
+                if not cached_df.empty:
+                    last_cached_date = cached_df['time'].iloc[-1]
+                    logger.info(f"[{instrument}] 📦 Cache found! Contains {len(cached_df)} rows. Fetching only NEW data since {last_cached_date.strftime('%Y-%m-%d %H:%M')}")
+            except Exception as e:
+                logger.warning(f"[{instrument}] Failed to read cache: {e}")
 
-        new_data_frames = []
-        
-        # -------------------------------------------------------------
-        # 2. YOUR EXISTING FETCH LOOP (Add the cache breaker)
-        # Note: Keep your existing Capital.com session logic here.
-        # This is pseudo-code for where to put the cache breaker:
-        # -------------------------------------------------------------
-        
-        # for batch in range(total_batches):
-        #     batch_df = ... # (Your existing fetch logic)
-        #     
-        #     if batch_df is not None and not batch_df.empty:
-        #         oldest_batch_date = batch_df['timestamp'].min()
-        #         new_data_frames.append(batch_df)
-        #
-        #         # 🛑 SMART CACHE BREAKER: If we paginated back into history we already have, stop fetching!
-        #         if last_cached_date and oldest_batch_date <= last_cached_date:
-        #             logger.info(f"[{epic}] 🛑 Reached cached historical data. Stopping fetch early.")
-        #             break 
-        
-        # 3. Combine, Clean, and Save
-        newly_fetched_df = pd.concat(new_data_frames, ignore_index=True) if new_data_frames else pd.DataFrame()
-        final_df = pd.concat([cached_df, newly_fetched_df], ignore_index=True)
-        
-        # Drop duplicates in case the API overlap fetched a candle twice
-        if not final_df.empty:
-            final_df['timestamp'] = pd.to_datetime(final_df['timestamp'])
-            final_df = final_df.drop_duplicates(subset=['timestamp']).sort_values('timestamp').reset_index(drop=True)
-            final_df.to_csv(cache_path, index=False)
+        resolution = self.RESOLUTION_MAP.get(granularity, "HOUR")
+        candles_per_day = {"MINUTE": 1440, "MINUTE_5": 288, "MINUTE_15": 96,
+                           "MINUTE_30": 48, "HOUR": 24, "HOUR_4": 6, "DAY": 1}.get(resolution, 24)
+        target_candles = int(years * 365 * candles_per_day)
+
+        all_frames = []
+        to_dt = pd.Timestamp.now(tz="UTC")
+        batch_size = 1000
+        max_batches = (target_candles // batch_size) + 2
+        consecutive_empty = 0
+
+        logger.info(f"[{instrument}] Initiating API sync...")
+
+        for batch_num in range(max_batches):
+            hours_per_batch = batch_size / candles_per_day
+            fallback_to_dt = to_dt - pd.Timedelta(hours=hours_per_batch * 1.05)
+
+            data = self.client._get(
+                f"/api/v1/prices/{epic}",
+                params={
+                    "resolution": resolution,
+                    "max": batch_size,
+                    "to": to_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+                },
+            )
+
+            if data is None or not data.get("prices"):
+                consecutive_empty += 1
+                if all_frames:
+                    logger.info(f"[{instrument}] No more history available — stopping at batch {batch_num}")
+                    break
+                if consecutive_empty >= 3:
+                    logger.warning(f"[{instrument}] 3 empty batches with no data at all — giving up")
+                    break
+                to_dt = fallback_to_dt
+                _time.sleep(1)
+                continue
+
+            consecutive_empty = 0
+            batch_df = self._parse_candles(data["prices"])
             
-        return final_df
+            if batch_df.empty:
+                to_dt = fallback_to_dt
+                continue
+
+            oldest_batch_date = batch_df.index.min()
+            all_frames.append(batch_df)
+            total_so_far = sum(len(f) for f in all_frames)
+            
+            # 🛑 SMART CACHE BREAKER: Did we overlap with data we already downloaded?
+            if last_cached_date and oldest_batch_date <= last_cached_date:
+                logger.info(f"[{instrument}] 🛑 Connected to local cache at {oldest_batch_date.strftime('%Y-%m-%d')}. Stopping fetch.")
+                break
+
+            # Move window back to just before the oldest candle in this batch
+            to_dt = batch_df.index[0] - pd.Timedelta(minutes=1)
+            logger.info(f"[{instrument}] Batch {batch_num+1}/{max_batches}: +{len(batch_df)} candles | total={total_so_far} | oldest={batch_df.index[0].date()}")
+
+            if not last_cached_date and total_so_far >= target_candles:
+                logger.info(f"[{instrument}] Target reached ({total_so_far} >= {target_candles}). Done.")
+                break
+
+        # 3. Combine, Clean, and Save
+        newly_fetched_df = pd.concat(all_frames).sort_index() if all_frames else pd.DataFrame()
+        
+        # Merge with existing cache if we had one
+        if not cached_df.empty:
+            cached_df.set_index('time', inplace=True)
+            final_df = pd.concat([cached_df, newly_fetched_df]).sort_index()
+        else:
+            final_df = newly_fetched_df
+
+        if not final_df.empty:
+            # Remove any overlapping dates that happened when the API batches intersected with the cache
+            final_df = final_df[~final_df.index.duplicated(keep="last")] 
+            logger.info(f"[{instrument}] Final Dataset: {len(final_df)} candles | {final_df.index[0].date()} → {final_df.index[-1].date()}")
+            
+            # Save the unified block back to CSV cache
+            try:
+                final_df.reset_index().to_csv(csv_cache_path, index=False)
+            except Exception as e:
+                logger.warning(f"[{instrument}] Failed to save cache: {e}")
+
+        return final_df if not final_df.empty else None
 
     def get_spread(self, instrument: str) -> float:
         """Get the current bid-ask spread for an instrument."""
