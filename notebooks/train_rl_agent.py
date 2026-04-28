@@ -61,7 +61,7 @@ def main():
     logger.info("🧠 Spawning Matrix Environments and Initializing PPO...")
     
     # Point the agent to where you want the weights saved
-    agent = RLAgent(model_path="/kaggle/working/ForexAI_State/models/rl_ppo_agent.pkl")
+    agent = RLAgent(model_path="/kaggle/working/ForexAI_State/models/rl_hybrid_agent.pkl")
     
     # 2. PUSH THE T4 GPUs TO MAXIMUM CAPACITY
     agent.train(
