@@ -16,7 +16,8 @@ class EnvState:
     winning_trades: jnp.ndarray
 
 class JaxForexEnv:
-    def __init__(self, data_matrix: jnp.ndarray, initial_balance: float = 1000.0, spread: float = 0.0001, window_size: int = 60):
+    # Reduced window size to 30 to save VRAM while retaining market context
+    def __init__(self, data_matrix: jnp.ndarray, initial_balance: float = 1000.0, spread: float = 0.0001, window_size: int = 30):
         self.data_matrix = data_matrix
         self.initial_balance = initial_balance
         self.spread = spread
@@ -43,7 +44,12 @@ class JaxForexEnv:
         window = jax.lax.dynamic_slice(self.data_matrix, (start_idx, 0), (self.window_size, self.num_features))
         window_flat = window.flatten()
 
-        current_price = self.data_matrix[state.current_step, 0]
+        # 🛡️ Z-SCORE NORMALIZATION: Prevents Math Explosions regardless of pair (JPY vs EUR)
+        w_mean = jnp.mean(window_flat)
+        w_std = jnp.std(window_flat) + 1e-8
+        window_flat = (window_flat - w_mean) / w_std
+
+        current_price = self.data_matrix[state.current_step, 3] # Assuming index 3 is Close
         
         unrealized_pnl_long = (current_price - state.entry_price) * state.units
         unrealized_pnl_short = (state.entry_price - current_price) * state.units
@@ -65,8 +71,8 @@ class JaxForexEnv:
         next_step = state.current_step + 1
         done = next_step >= self.max_steps
 
-        current_price = self.data_matrix[state.current_step, 0]
-        prev_price = self.data_matrix[state.current_step - 1, 0]
+        current_price = self.data_matrix[state.current_step, 3]
+        prev_price = self.data_matrix[state.current_step - 1, 3]
 
         step_pnl_long = (current_price - prev_price) * state.units
         step_pnl_short = (prev_price - current_price) * state.units
@@ -130,8 +136,13 @@ class JaxForexEnv:
 
         new_max_net_worth = jnp.maximum(state.max_net_worth, new_net_worth)
 
-        # 🧠 ML INCENTIVE MECHANISM: Heavy bonus for a successful trade, penalty for a loss
-        trade_incentive = jnp.where(realized_pnl > 0, 0.05 * self.initial_balance, jnp.where(realized_pnl < 0, -0.05 * self.initial_balance, 0.0))
+        # ⚖️ STRICT REWARD SHAPING
+        # Amplify winning behavior, severely punish losing behavior.
+        trade_incentive = jnp.where(
+            realized_pnl > 0, 
+            realized_pnl * 5.0, # Huge bonus for closing in profit
+            jnp.where(realized_pnl < 0, realized_pnl * 5.0 - (0.02 * self.initial_balance), 0.0) # Penalty for losing + flat punishment
+        )
         
         reward = step_pnl + trade_penalty + trade_incentive
         

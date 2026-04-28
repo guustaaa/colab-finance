@@ -18,17 +18,10 @@ from src.environment import JaxForexEnv
 
 logger = logging.getLogger("rl_agent")
 
-# =====================================================================
-# 🧠 PST-TRADER WITH MIXED-PRECISION & SEQUENTIAL MINI-BATCHING
-# =====================================================================
-
 class Actor(nn.Module):
     action_dim: int
     @nn.compact
     def __call__(self, x):
-        x = nn.LayerNorm()(x)
-        
-        # Mixed-Precision Execution (bfloat16) to save VRAM
         x = jnp.asarray(x, dtype=jnp.bfloat16)
         init_fn = nn.initializers.orthogonal(np.sqrt(2))
         
@@ -37,25 +30,21 @@ class Actor(nn.Module):
         x = nn.Dense(512, dtype=jnp.bfloat16, kernel_init=init_fn)(x)
         x = nn.tanh(x)
         
-        # Cast back to float32 for stable probability calculations
         logits = nn.Dense(self.action_dim, dtype=jnp.float32, kernel_init=nn.initializers.orthogonal(0.01))(x)
         return logits
 
 class TwinCritic(nn.Module):
     @nn.compact
     def __call__(self, x):
-        x = nn.LayerNorm()(x)
         x = jnp.asarray(x, dtype=jnp.bfloat16)
         init_fn = nn.initializers.orthogonal(np.sqrt(2))
         
-        # Critic 1 (bfloat16)
         c1 = nn.Dense(512, dtype=jnp.bfloat16, kernel_init=init_fn)(x)
         c1 = nn.relu(c1)
         c1 = nn.Dense(512, dtype=jnp.bfloat16, kernel_init=init_fn)(c1)
         c1 = nn.relu(c1)
         v1 = nn.Dense(1, dtype=jnp.float32, kernel_init=nn.initializers.orthogonal(1.0))(c1)
         
-        # Critic 2 (bfloat16)
         c2 = nn.Dense(512, dtype=jnp.bfloat16, kernel_init=init_fn)(x)
         c2 = nn.relu(c2)
         c2 = nn.Dense(512, dtype=jnp.bfloat16, kernel_init=init_fn)(c2)
@@ -76,7 +65,7 @@ class HybridNetwork(nn.Module):
         return logits, v1, v2
 
 class RLAgent:
-    def __init__(self, model_path: str = "/kaggle/working/ForexAI_State/models/rl_pst_trader_v4.pkl", device: str = "auto"):
+    def __init__(self, model_path: str = "/kaggle/working/ForexAI_State/models/rl_pst_trader_v5.pkl", device: str = "auto"):
         self.model_path = model_path
         self.action_dim = 4
         self.network = HybridNetwork(action_dim=self.action_dim)
@@ -88,14 +77,10 @@ class RLAgent:
         self.params = None
         
     def train(self, data_dict: dict, total_timesteps: int = 500_000_000):
-        # =====================================================================
-        # 🚀 THE 14GB VRAM TITAN CONFIGURATION
-        # Maximizes the Dual T4 hardware limits productively.
-        # =====================================================================
-        N_ENVS = 65536         # 65,536 parallel universes (was 8,192)
-        CHUNK_SIZE = 256       # 256 temporal steps per universe (was 128)
-        NUM_MINIBATCHES = 64   # 64 slices to prevent backward-pass OOM (was 16)
-        # =====================================================================
+        # 🧠 VRAM SAFETY LIMITS (Prevents 13.4GB OOM Error)
+        N_ENVS = 4096       
+        CHUNK_SIZE = 128    
+        NUM_MINIBATCHES = 16 
         
         logger.info(f"Aggregating data from {len(data_dict)} currency pairs...")
         combined_df = pd.concat(list(data_dict.values()), ignore_index=True)
@@ -114,7 +99,7 @@ class RLAgent:
         opt_state = self.optimizer.init(self.params)
         
         if self.load():
-            logger.info("Resuming from safe v4 Checkpoint...")
+            logger.info("Resuming from safe v5 Checkpoint...")
             
         replicated_params = jax.tree.map(lambda x: jnp.stack([x] * num_devices), self.params)
         replicated_opt_state = jax.tree.map(lambda x: jnp.stack([x] * num_devices), opt_state)
@@ -124,8 +109,6 @@ class RLAgent:
 
         @partial(jax.pmap, axis_name='p')
         def process_chunk(params, opt_state, step_rngs_mapped, states, obs):
-            
-            # PHASE 1: CONTINUOUS STREAM ROLLOUT
             def rollout_step(carry, unused):
                 carry_rng, current_states, current_obs = carry
                 carry_rng, step_rng = jax.random.split(carry_rng)
@@ -138,7 +121,6 @@ class RLAgent:
                 
                 next_obs, next_states, rewards, dones, infos = jax.vmap(env.step)(current_states, actions)
                 
-                # Iterable Pipeline / Continuous Stream
                 def single_reset(s, k):
                     rs = jax.random.randint(k, (), minval=env.window_size, maxval=env.max_steps - 1000)
                     return s.replace(
@@ -165,7 +147,6 @@ class RLAgent:
             )
             obs_batch, actions_batch, log_probs_batch, rewards_batch, values_batch, dones_batch = trajectories
             
-            # PHASE 2: REVERSE BELLMAN ESTIMATION
             _, next_v1, next_v2 = self.network.apply(params, next_obs)
             next_v = jnp.minimum(next_v1, next_v2)
             
@@ -181,17 +162,28 @@ class RLAgent:
             adv_std = jnp.std(advantages_batch) + 1e-8
             norm_advantages_batch = (advantages_batch - adv_mean) / adv_std
             
-            # 🛠️ PHASE 3: SEQUENTIAL MINI-BATCHING (Prevents Compiler Hangs & OOM)
+            step_rngs_mapped, shuffle_rng = jax.random.split(step_rngs_mapped)
+            flat_size = CHUNK_SIZE * (N_ENVS // jax.local_device_count())
+            indices = jax.random.permutation(shuffle_rng, flat_size)
+            
+            def flatten_and_shuffle(x):
+                return x.reshape(flat_size, -1).squeeze()[indices]
+            
+            f_obs = flatten_and_shuffle(obs_batch)
+            f_actions = flatten_and_shuffle(actions_batch)
+            f_log_probs = flatten_and_shuffle(log_probs_batch)
+            f_returns = flatten_and_shuffle(returns_batch)
+            f_advs = flatten_and_shuffle(norm_advantages_batch)
+            
             def reshape_to_minibatches(x):
-                flat_x = x.reshape(-1, *x.shape[2:])
-                mb_size = flat_x.shape[0] // NUM_MINIBATCHES
-                return flat_x.reshape(NUM_MINIBATCHES, mb_size, *flat_x.shape[1:])
+                mb_size = x.shape[0] // NUM_MINIBATCHES
+                return x.reshape(NUM_MINIBATCHES, mb_size, *x.shape[1:])
 
-            mb_obs = reshape_to_minibatches(obs_batch)
-            mb_actions = reshape_to_minibatches(actions_batch)
-            mb_log_probs = reshape_to_minibatches(log_probs_batch)
-            mb_returns = reshape_to_minibatches(returns_batch)
-            mb_advs = reshape_to_minibatches(norm_advantages_batch)
+            mb_obs = reshape_to_minibatches(f_obs)
+            mb_actions = reshape_to_minibatches(f_actions)
+            mb_log_probs = reshape_to_minibatches(f_log_probs)
+            mb_returns = reshape_to_minibatches(f_returns)
+            mb_advs = reshape_to_minibatches(f_advs)
 
             def update_minibatch(carry, batch_data):
                 p_carry, opt_carry = carry
@@ -219,7 +211,6 @@ class RLAgent:
                 
                 return (p_carry, opt_carry), loss
 
-            # Sequentially process the 16 minibatches within the compiled graph
             (params, opt_state), batch_losses = jax.lax.scan(
                 update_minibatch, 
                 (params, opt_state), 
@@ -243,7 +234,7 @@ class RLAgent:
         states = init_envs(state_keys)
         obs = get_obs_pmap(states)
 
-        logger.info(f"🚀 SEQUENTIAL MINI-BATCH ENGINE ONLINE.")
+        logger.info(f"🚀 V5 DECOUPLED PPO ENGINE ONLINE (OOM-Safe).")
         start_time = time.time()
         
         epoch = 0
@@ -274,7 +265,7 @@ class RLAgent:
                 win_rate = (winning_trades_count / jnp.maximum(1, total_trades_count)) * 100.0
 
                 print(f"----------------------------------------")
-                print(f"| DECOUPLED PST-TRADER    |            |")
+                print(f"| V5 PST-TRADER METRICS   |            |")
                 print(f"|    fps                  | {fps:<10} |")
                 print(f"|    total_timesteps      | {epoch * steps_per_epoch:<10} |")
                 print(f"| accuracy/               |            |")
@@ -290,7 +281,7 @@ class RLAgent:
                 os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
                 with open(self.model_path, 'wb') as f:
                     pickle.dump(self.params, f)
-                logger.info(f"💾 v4 Checkpoint Saved.")
+                logger.info(f"💾 v5 Checkpoint Saved.")
             epoch += 1
 
     def load(self):
@@ -299,10 +290,3 @@ class RLAgent:
                 self.params = pickle.load(f)
             return True
         return False
-
-    def predict(self, obs: np.ndarray) -> int:
-        if self.params is None:
-            return 0
-        obs_jnp = jnp.array(obs, dtype=jnp.float32)
-        logits, _, _ = self.network.apply(self.params, obs_jnp)
-        return int(jnp.argmax(logits))
