@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 import logging
 import pickle
+import time
 from functools import partial
 from src.environment import JaxForexEnv
 
@@ -31,7 +32,7 @@ class ActorCritic(nn.Module):
         return logits, jnp.squeeze(value, axis=-1)
 
 class RLAgent:
-    def __init__(self, model_path: str = "models/ppo_agent.pkl", device: str = "auto"):
+    def __init__(self, model_path: str = "/kaggle/working/ForexAI_State/models/rl_ppo_agent.pkl", device: str = "auto"):
         self.model_path = model_path
         self.action_dim = 4
         self.network = ActorCritic(action_dim=self.action_dim)
@@ -57,6 +58,10 @@ class RLAgent:
         self.params = self.network.init(init_rng, dummy_obs)
         opt_state = self.optimizer.init(self.params)
         
+        # Load existing weights if they exist (for true continuous continuation)
+        if self.load():
+            logger.info("Resuming training from existing local checkpoint...")
+            
         replicated_params = jax.tree.map(lambda x: jnp.stack([x] * num_devices), self.params)
         replicated_opt_state = jax.tree.map(lambda x: jnp.stack([x] * num_devices), opt_state)
 
@@ -73,11 +78,6 @@ class RLAgent:
             
             return loss_actor + 0.5 * loss_critic - 0.01 * entropy
 
-        # =====================================================================
-        # 🚀 THE GPU SATURATION ENGINE
-        # This compiles 100 environment steps into a single GPU instruction.
-        # Python CPU does nothing while the GPU blasts through this loop.
-        # =====================================================================
         CHUNK_SIZE = 100 
         
         @partial(jax.pmap, axis_name='p')
@@ -86,41 +86,29 @@ class RLAgent:
                 params, opt_state, rng, states, obs = carry
                 rng, step_rng = jax.random.split(rng)
                 
-                # 1. Act (100% on GPU)
                 logits, values = self.network.apply(params, obs)
                 actions = jax.random.categorical(step_rng, logits)
                 log_probs = jnp.take_along_axis(jax.nn.log_softmax(logits), actions[:, None], axis=-1).squeeze(-1)
                 
-                # 2. Step Envs (100% on GPU)
                 next_obs, next_states, rewards, dones, infos = jax.vmap(env.step)(states, actions)
                 
-                # 3. PPO Math (100% on GPU)
                 advantages = rewards - values
                 returns = rewards + 0.99 * values
                 
-                # 4. Gradient Update (100% on GPU)
                 grad_fn = jax.value_and_grad(ppo_loss)
                 loss, grads = grad_fn(params, obs, actions, advantages, returns, log_probs)
-                grads = jax.lax.pmean(grads, axis_name='p') # Sync between the 2x T4s
+                grads = jax.lax.pmean(grads, axis_name='p')
                 updates, opt_state = self.optimizer.update(grads, opt_state)
                 params = optax.apply_updates(params, updates)
                 
                 return (params, opt_state, rng, next_states, next_obs), (loss, rewards)
 
-            # jax.lax.scan loops purely in VRAM without returning to the Python CPU
             carry = (params, opt_state, rng, states, obs)
             carry, (losses, rewards) = jax.lax.scan(_step, carry, None, length=CHUNK_SIZE)
-            
             params, opt_state, rng, states, obs = carry
-            # Only return the averaged metrics to the CPU at the very end
             return params, opt_state, rng, states, obs, jnp.mean(losses), jnp.mean(rewards)
-
-        # =====================================================================
         
-        # Calculate Epochs
         steps_per_epoch = n_envs * CHUNK_SIZE
-        epochs = total_timesteps // steps_per_epoch
-        
         state_keys = jax.random.split(rng, num_devices)
         step_rngs = jax.random.split(jax.random.split(rng)[1], num_devices)
         
@@ -136,48 +124,56 @@ class RLAgent:
         states = init_envs(state_keys)
         obs = get_obs_pmap(states)
 
-        logger.info(f"🚀 IGNITION: Simulating {total_timesteps:,} steps across {n_envs} Matrix Environments...")
-        logger.info(f"🔥 Chunk Size: {CHUNK_SIZE} steps per Python iteration (GPU is locked for {steps_per_epoch} decisions per tick)")
+        logger.info(f"🚀 IGNITION: Starting CONTINUOUS Matrix Simulation...")
+        logger.info(f"🔥 Chunk Size: {CHUNK_SIZE} steps per loop. Auto-saving locally every 500 chunks.")
         
-        import time
         start_time = time.time()
         
-        for epoch in range(epochs):
-            # 💥 The Python CPU fires one command, and the GPUs process 409,600 steps.
+        epoch = 0
+        while True: # Infinite Continuous Loop
             replicated_params, replicated_opt_state, step_rngs, states, obs, loss_mean, reward_mean = process_chunk(
                 replicated_params, replicated_opt_state, step_rngs, states, obs
             )
 
-            # Log metrics (now happening 100x less frequently on the CPU side)
-            if epoch % 10 == 0 or epoch == epochs - 1:
+            # Log metrics every 10 chunks
+            if epoch % 10 == 0:
                 elapsed = time.time() - start_time
                 fps = int((epoch * steps_per_epoch) / elapsed) if elapsed > 0 else 0
                 
+                # Calculate the global win rate across all 4096 matrix instances
+                total_trades_count = jnp.sum(states.total_trades)
+                winning_trades_count = jnp.sum(states.winning_trades)
+                win_rate = (winning_trades_count / jnp.maximum(1, total_trades_count)) * 100.0
+
                 print(f"----------------------------------------")
                 print(f"| time/                   |            |")
                 print(f"|    fps                  | {fps:<10} |")
                 print(f"|    chunks_processed     | {epoch:<10} |")
                 print(f"|    time_elapsed (s)     | {int(elapsed):<10} |")
                 print(f"|    total_timesteps      | {epoch * steps_per_epoch:<10} |")
+                print(f"| accuracy/               |            |")
+                print(f"|    win_rate (%)         | {win_rate:<10.2f} |")
+                print(f"|    total_trades         | {total_trades_count:<10} |")
                 print(f"| train/                  |            |")
                 print(f"|    mean_reward          | {jnp.mean(reward_mean):<10.5f} |")
                 print(f"|    loss                 | {jnp.mean(loss_mean):<10.5f} |")
                 print(f"----------------------------------------")
 
-        self.params = jax.tree.map(lambda x: x[0], replicated_params)
-        
-        os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
-        with open(self.model_path, 'wb') as f:
-            pickle.dump(self.params, f)
-        logger.info(f"✅ Training Complete. RL Agent saved to {self.model_path}")
+            # Local Periodic Save every 500 chunks
+            if epoch % 500 == 0 and epoch > 0:
+                self.params = jax.tree.map(lambda x: x[0], replicated_params)
+                os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
+                with open(self.model_path, 'wb') as f:
+                    pickle.dump(self.params, f)
+                logger.info(f"💾 Checkpoint Saved to {self.model_path}")
+            
+            epoch += 1
 
     def load(self):
         if os.path.exists(self.model_path):
             with open(self.model_path, 'rb') as f:
                 self.params = pickle.load(f)
-            logger.info(f"Loaded RL Agent from {self.model_path}")
             return True
-        logger.warning(f"Could not find RL Agent at {self.model_path}")
         return False
 
     def predict(self, obs: np.ndarray) -> int:

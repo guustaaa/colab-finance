@@ -12,6 +12,8 @@ class EnvState:
     position: jnp.ndarray
     entry_price: jnp.ndarray
     units: jnp.ndarray
+    total_trades: jnp.ndarray
+    winning_trades: jnp.ndarray
 
 class JaxForexEnv:
     def __init__(self, data_matrix: jnp.ndarray, initial_balance: float = 1000.0, spread: float = 0.0001, window_size: int = 60):
@@ -30,7 +32,9 @@ class JaxForexEnv:
             max_net_worth=jnp.array(self.initial_balance, dtype=jnp.float32),
             position=jnp.array(0, dtype=jnp.int32),
             entry_price=jnp.array(0.0, dtype=jnp.float32),
-            units=jnp.array(0.0, dtype=jnp.float32)
+            units=jnp.array(0.0, dtype=jnp.float32),
+            total_trades=jnp.array(0, dtype=jnp.int32),
+            winning_trades=jnp.array(0, dtype=jnp.int32)
         )
         return self._get_obs(state), state
 
@@ -70,51 +74,66 @@ class JaxForexEnv:
         
         new_net_worth = state.net_worth + step_pnl
 
-        trade_penalty = jnp.array(0.0, dtype=jnp.float32)
-        new_balance = state.balance
-        new_position = state.position
-        new_entry_price = state.entry_price
-        new_units = state.units
-
         close_long_pnl = (current_price - state.entry_price) * state.units
         close_short_pnl = (state.entry_price - current_price) * state.units
 
         def do_buy(args):
-            b, p, ep, u, tp = args
-            b = jnp.where(p == -1, b + close_short_pnl, b)
+            b, p, ep, u, tp, tt, wt, real_pnl = args
+            is_reversal = (p == -1)
+            real_pnl = jnp.where(is_reversal, close_short_pnl, 0.0)
+            b = b + real_pnl
+            tt = tt + jnp.where(is_reversal, 1, 0)
+            wt = wt + jnp.where(is_reversal & (real_pnl > 0), 1, 0)
+            
             p = 1
             ep = current_price + (self.spread / 2)
             u = (b * 0.02) / (ep * 0.01)
             tp = -(self.spread * u)
-            return b, p, ep, u, tp
+            return b, p, ep, u, tp, tt, wt, real_pnl
 
         def do_sell(args):
-            b, p, ep, u, tp = args
-            b = jnp.where(p == 1, b + close_long_pnl, b)
+            b, p, ep, u, tp, tt, wt, real_pnl = args
+            is_reversal = (p == 1)
+            real_pnl = jnp.where(is_reversal, close_long_pnl, 0.0)
+            b = b + real_pnl
+            tt = tt + jnp.where(is_reversal, 1, 0)
+            wt = wt + jnp.where(is_reversal & (real_pnl > 0), 1, 0)
+            
             p = -1
             ep = current_price - (self.spread / 2)
             u = (b * 0.02) / (ep * 0.01)
             tp = -(self.spread * u)
-            return b, p, ep, u, tp
+            return b, p, ep, u, tp, tt, wt, real_pnl
 
         def do_close(args):
-            b, p, ep, u, tp = args
-            b = jnp.where(p == 1, b + close_long_pnl, jnp.where(p == -1, b + close_short_pnl, b))
+            b, p, ep, u, tp, tt, wt, real_pnl = args
+            is_closing_long = (p == 1)
+            is_closing_short = (p == -1)
+            real_pnl = jnp.where(is_closing_long, close_long_pnl, jnp.where(is_closing_short, close_short_pnl, 0.0))
+            
+            b = b + real_pnl
+            is_closing = is_closing_long | is_closing_short
+            tt = tt + jnp.where(is_closing, 1, 0)
+            wt = wt + jnp.where(is_closing & (real_pnl > 0), 1, 0)
+            
             p = 0
             ep = 0.0
             u = 0.0
-            return b, p, ep, u, tp
+            return b, p, ep, u, tp, tt, wt, real_pnl
 
         def do_hold(args):
             return args
 
-        args = (new_balance, new_position, new_entry_price, new_units, trade_penalty)
+        args = (state.balance, state.position, state.entry_price, state.units, jnp.array(0.0, dtype=jnp.float32), state.total_trades, state.winning_trades, jnp.array(0.0, dtype=jnp.float32))
         args = jax.lax.switch(action, [do_hold, do_buy, do_sell, do_close], args)
-        new_balance, new_position, new_entry_price, new_units, trade_penalty = args
+        new_balance, new_position, new_entry_price, new_units, trade_penalty, new_total_trades, new_winning_trades, realized_pnl = args
 
         new_max_net_worth = jnp.maximum(state.max_net_worth, new_net_worth)
 
-        reward = step_pnl + trade_penalty
+        # 🧠 ML INCENTIVE MECHANISM: Heavy bonus for a successful trade, penalty for a loss
+        trade_incentive = jnp.where(realized_pnl > 0, 0.05 * self.initial_balance, jnp.where(realized_pnl < 0, -0.05 * self.initial_balance, 0.0))
+        
+        reward = step_pnl + trade_penalty + trade_incentive
         
         drawdown = (new_max_net_worth - new_net_worth) / new_max_net_worth
         reward = jnp.where(drawdown > 0.10, reward - (drawdown * 10), reward)
@@ -132,7 +151,9 @@ class JaxForexEnv:
             max_net_worth=new_max_net_worth,
             position=new_position,
             entry_price=new_entry_price,
-            units=new_units
+            units=new_units,
+            total_trades=new_total_trades,
+            winning_trades=new_winning_trades
         )
         
         obs = self._get_obs(new_state)
