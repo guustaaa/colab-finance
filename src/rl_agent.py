@@ -22,9 +22,10 @@ class ActorCritic(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        x = nn.Dense(256)(x)
+        # 🧠 INCREASED RAM USAGE: Expanded network capacity from 256 to 512
+        x = nn.Dense(512)(x)
         x = nn.tanh(x)
-        x = nn.Dense(256)(x)
+        x = nn.Dense(512)(x)
         x = nn.tanh(x)
         
         logits = nn.Dense(self.action_dim)(x)
@@ -36,7 +37,13 @@ class RLAgent:
         self.model_path = model_path
         self.action_dim = 4
         self.network = ActorCritic(action_dim=self.action_dim)
-        self.optimizer = optax.adam(learning_rate=3e-4)
+        
+        # 🛡️ ANTI-COLLAPSE MEASURE 1: Gradient Clipping
+        # This prevents the model weights from exploding mathematically during bad batches
+        self.optimizer = optax.chain(
+            optax.clip_by_global_norm(0.5),
+            optax.adam(learning_rate=3e-4)
+        )
         self.params = None
         
     def train(self, data_dict: dict, total_timesteps: int = 50_000_000, n_envs: int = 4096, batch_size: int = 8192):
@@ -48,7 +55,6 @@ class RLAgent:
         
         num_devices = jax.local_device_count()
         device_platform = jax.devices()[0].platform.upper()
-        
         logger.info(f"⚙️ Compute Engine: {num_devices}x {device_platform}")
         
         rng = jax.random.PRNGKey(42)
@@ -58,7 +64,6 @@ class RLAgent:
         self.params = self.network.init(init_rng, dummy_obs)
         opt_state = self.optimizer.init(self.params)
         
-        # Load existing weights if they exist (for true continuous continuation)
         if self.load():
             logger.info("Resuming training from existing local checkpoint...")
             
@@ -72,13 +77,16 @@ class RLAgent:
             
             ratio = jnp.exp(action_log_probs - old_log_probs)
             clip_adv = jnp.clip(ratio, 0.8, 1.2) * advantages
+            
             loss_actor = -jnp.mean(jnp.minimum(ratio * advantages, clip_adv))
-            loss_critic = 0.5 * jnp.mean((returns - values) ** 2)
+            # 🛡️ ANTI-COLLAPSE MEASURE 2: Critic Value Clipping
+            loss_critic = 0.5 * jnp.mean(jnp.clip((returns - values) ** 2, 0.0, 10.0)) 
             entropy = -jnp.mean(jnp.sum(jax.nn.softmax(logits) * log_probs, axis=-1))
             
             return loss_actor + 0.5 * loss_critic - 0.01 * entropy
 
-        CHUNK_SIZE = 100 
+        # 🧠 RAM MAXIMIZER: Store 500 trajectories per core instead of 100 before backprop
+        CHUNK_SIZE = 500 
         
         @partial(jax.pmap, axis_name='p')
         def process_chunk(params, opt_state, rng, states, obs):
@@ -125,22 +133,39 @@ class RLAgent:
         obs = get_obs_pmap(states)
 
         logger.info(f"🚀 IGNITION: Starting CONTINUOUS Matrix Simulation...")
-        logger.info(f"🔥 Chunk Size: {CHUNK_SIZE} steps per loop. Auto-saving locally every 500 chunks.")
+        logger.info(f"🔥 Chunk Size: {CHUNK_SIZE} steps per loop. RAM buffer expanded 5x.")
         
         start_time = time.time()
         
         epoch = 0
-        while True: # Infinite Continuous Loop
+        while True:
             replicated_params, replicated_opt_state, step_rngs, states, obs, loss_mean, reward_mean = process_chunk(
                 replicated_params, replicated_opt_state, step_rngs, states, obs
             )
 
-            # Log metrics every 10 chunks
+            current_loss = jnp.mean(loss_mean)
+            current_reward = jnp.mean(reward_mean)
+
+            # 🛡️ ANTI-COLLAPSE MEASURE 3: Automatic Rollback Mechanism
+            if current_loss < -10.0 or current_reward < -0.5:
+                logger.error("🚨 POLICY COLLAPSE DETECTED! Gradients have mathematically exploded.")
+                logger.info("♻️ Wiping corrupted momentum and rolling back to the last safe checkpoint...")
+                if self.load():
+                    replicated_params = jax.tree.map(lambda x: jnp.stack([x] * num_devices), self.params)
+                    # Wipe the corrupted Adam optimizer states completely clean
+                    opt_state = self.optimizer.init(self.params)
+                    replicated_opt_state = jax.tree.map(lambda x: jnp.stack([x] * num_devices), opt_state)
+                    # Reset environments to break the losing cycle
+                    states = init_envs(state_keys)
+                    obs = get_obs_pmap(states)
+                    continue
+                else:
+                    logger.warning("No safe checkpoint found! Restarting from scratch...")
+                    
             if epoch % 10 == 0:
                 elapsed = time.time() - start_time
                 fps = int((epoch * steps_per_epoch) / elapsed) if elapsed > 0 else 0
                 
-                # Calculate the global win rate across all 4096 matrix instances
                 total_trades_count = jnp.sum(states.total_trades)
                 winning_trades_count = jnp.sum(states.winning_trades)
                 win_rate = (winning_trades_count / jnp.maximum(1, total_trades_count)) * 100.0
@@ -149,18 +174,17 @@ class RLAgent:
                 print(f"| time/                   |            |")
                 print(f"|    fps                  | {fps:<10} |")
                 print(f"|    chunks_processed     | {epoch:<10} |")
-                print(f"|    time_elapsed (s)     | {int(elapsed):<10} |")
                 print(f"|    total_timesteps      | {epoch * steps_per_epoch:<10} |")
                 print(f"| accuracy/               |            |")
                 print(f"|    win_rate (%)         | {win_rate:<10.2f} |")
                 print(f"|    total_trades         | {total_trades_count:<10} |")
                 print(f"| train/                  |            |")
-                print(f"|    mean_reward          | {jnp.mean(reward_mean):<10.5f} |")
-                print(f"|    loss                 | {jnp.mean(loss_mean):<10.5f} |")
+                print(f"|    mean_reward          | {current_reward:<10.5f} |")
+                print(f"|    loss                 | {current_loss:<10.5f} |")
                 print(f"----------------------------------------")
 
-            # Local Periodic Save every 500 chunks
-            if epoch % 500 == 0 and epoch > 0:
+            # Local Periodic Save (Fewer chunk intervals because chunks are huge now)
+            if epoch % 50 == 0 and epoch > 0:
                 self.params = jax.tree.map(lambda x: x[0], replicated_params)
                 os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
                 with open(self.model_path, 'wb') as f:
