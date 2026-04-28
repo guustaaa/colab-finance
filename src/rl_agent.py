@@ -39,22 +39,17 @@ class RLAgent:
         self.params = None
         
     def train(self, data_dict: dict, total_timesteps: int = 50_000_000, n_envs: int = 4096, batch_size: int = 8192):
-        # 1. Combine all pairs into one massive super-matrix
         logger.info(f"Aggregating data from {len(data_dict)} currency pairs...")
         combined_df = pd.concat(list(data_dict.values()), ignore_index=True)
         data_matrix = jnp.array(combined_df.values, dtype=jnp.float32)
         
         env = JaxForexEnv(data_matrix=data_matrix)
         
-        # 2. Enforce Dual-GPU Usage
         num_devices = jax.local_device_count()
         device_platform = jax.devices()[0].platform.upper()
         
         logger.info(f"⚙️ Compute Engine: {num_devices}x {device_platform}")
-        if device_platform != 'GPU':
-            logger.error("🚨 CRITICAL WARNING: JAX IS RUNNING ON CPU!")
-            logger.error("If running on Kaggle, ensure 'T4 x2' is selected and install: !pip install -U \"jax[cuda12]\"")
-            
+        
         rng = jax.random.PRNGKey(42)
         rng, init_rng = jax.random.split(rng)
         
@@ -78,27 +73,56 @@ class RLAgent:
             
             return loss_actor + 0.5 * loss_critic - 0.01 * entropy
 
-        @partial(jax.pmap, axis_name='p')
-        def update_step(params, opt_state, obs, actions, advantages, returns, old_log_probs):
-            grad_fn = jax.value_and_grad(ppo_loss)
-            loss, grads = grad_fn(params, obs, actions, advantages, returns, old_log_probs)
-            grads = jax.lax.pmean(grads, axis_name='p')
-            updates, opt_state = self.optimizer.update(grads, opt_state)
-            params = optax.apply_updates(params, updates)
-            return params, opt_state, loss
-
-        @partial(jax.pmap, axis_name='p')
-        def act(params, rng, obs):
-            logits, val = self.network.apply(params, obs)
-            action = jax.random.categorical(rng, logits)
-            log_prob = jnp.take_along_axis(jax.nn.log_softmax(logits), action[:, None], axis=-1).squeeze(-1)
-            return action, log_prob, val
+        # =====================================================================
+        # 🚀 THE GPU SATURATION ENGINE
+        # This compiles 100 environment steps into a single GPU instruction.
+        # Python CPU does nothing while the GPU blasts through this loop.
+        # =====================================================================
+        CHUNK_SIZE = 100 
         
-        # Calculate Epochs based on n_envs and num_devices
-        steps_per_epoch = n_envs
+        @partial(jax.pmap, axis_name='p')
+        def process_chunk(params, opt_state, rng, states, obs):
+            def _step(carry, unused):
+                params, opt_state, rng, states, obs = carry
+                rng, step_rng = jax.random.split(rng)
+                
+                # 1. Act (100% on GPU)
+                logits, values = self.network.apply(params, obs)
+                actions = jax.random.categorical(step_rng, logits)
+                log_probs = jnp.take_along_axis(jax.nn.log_softmax(logits), actions[:, None], axis=-1).squeeze(-1)
+                
+                # 2. Step Envs (100% on GPU)
+                next_obs, next_states, rewards, dones, infos = jax.vmap(env.step)(states, actions)
+                
+                # 3. PPO Math (100% on GPU)
+                advantages = rewards - values
+                returns = rewards + 0.99 * values
+                
+                # 4. Gradient Update (100% on GPU)
+                grad_fn = jax.value_and_grad(ppo_loss)
+                loss, grads = grad_fn(params, obs, actions, advantages, returns, log_probs)
+                grads = jax.lax.pmean(grads, axis_name='p') # Sync between the 2x T4s
+                updates, opt_state = self.optimizer.update(grads, opt_state)
+                params = optax.apply_updates(params, updates)
+                
+                return (params, opt_state, rng, next_states, next_obs), (loss, rewards)
+
+            # jax.lax.scan loops purely in VRAM without returning to the Python CPU
+            carry = (params, opt_state, rng, states, obs)
+            carry, (losses, rewards) = jax.lax.scan(_step, carry, None, length=CHUNK_SIZE)
+            
+            params, opt_state, rng, states, obs = carry
+            # Only return the averaged metrics to the CPU at the very end
+            return params, opt_state, rng, states, obs, jnp.mean(losses), jnp.mean(rewards)
+
+        # =====================================================================
+        
+        # Calculate Epochs
+        steps_per_epoch = n_envs * CHUNK_SIZE
         epochs = total_timesteps // steps_per_epoch
         
         state_keys = jax.random.split(rng, num_devices)
+        step_rngs = jax.random.split(jax.random.split(rng)[1], num_devices)
         
         @partial(jax.pmap, axis_name='p')
         def init_envs(key):
@@ -113,48 +137,31 @@ class RLAgent:
         obs = get_obs_pmap(states)
 
         logger.info(f"🚀 IGNITION: Simulating {total_timesteps:,} steps across {n_envs} Matrix Environments...")
+        logger.info(f"🔥 Chunk Size: {CHUNK_SIZE} steps per Python iteration (GPU is locked for {steps_per_epoch} decisions per tick)")
         
         import time
         start_time = time.time()
         
-        # 3. Main Training Loop with Restored Logging
         for epoch in range(epochs):
-            rng, step_rng = jax.random.split(rng)
-            step_rngs = jax.random.split(step_rng, num_devices)
-            
-            actions, log_probs, values = act(replicated_params, step_rngs, obs)
-            
-            @partial(jax.pmap, axis_name='p')
-            def step_envs(states, actions):
-                return jax.vmap(env.step)(states, actions)
-
-            next_obs, next_states, rewards, dones, infos = step_envs(states, actions)
-            
-            advantages = rewards - values
-            returns = rewards + 0.99 * values
-            
-            replicated_params, replicated_opt_state, loss = update_step(
-                replicated_params, replicated_opt_state, obs, actions, advantages, returns, log_probs
+            # 💥 The Python CPU fires one command, and the GPUs process 409,600 steps.
+            replicated_params, replicated_opt_state, step_rngs, states, obs, loss_mean, reward_mean = process_chunk(
+                replicated_params, replicated_opt_state, step_rngs, states, obs
             )
-            
-            obs = next_obs
-            states = next_states
 
-            # Log metrics every 100 epochs
-            if epoch % 100 == 0 or epoch == epochs - 1:
+            # Log metrics (now happening 100x less frequently on the CPU side)
+            if epoch % 10 == 0 or epoch == epochs - 1:
                 elapsed = time.time() - start_time
                 fps = int((epoch * steps_per_epoch) / elapsed) if elapsed > 0 else 0
-                mean_reward = jnp.mean(rewards)
                 
                 print(f"----------------------------------------")
                 print(f"| time/                   |            |")
                 print(f"|    fps                  | {fps:<10} |")
-                print(f"|    iterations           | {epoch:<10} |")
+                print(f"|    chunks_processed     | {epoch:<10} |")
                 print(f"|    time_elapsed (s)     | {int(elapsed):<10} |")
                 print(f"|    total_timesteps      | {epoch * steps_per_epoch:<10} |")
                 print(f"| train/                  |            |")
-                print(f"|    mean_reward          | {mean_reward:<10.5f} |")
-                print(f"|    loss                 | {jnp.mean(loss):<10.5f} |")
+                print(f"|    mean_reward          | {jnp.mean(reward_mean):<10.5f} |")
+                print(f"|    loss                 | {jnp.mean(loss_mean):<10.5f} |")
                 print(f"----------------------------------------")
 
         self.params = jax.tree.map(lambda x: x[0], replicated_params)
