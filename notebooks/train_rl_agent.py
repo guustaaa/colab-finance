@@ -21,14 +21,27 @@ logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(name)s | %(level
 logger = logging.getLogger("rl_trainer")
 
 def main():
-    # Initialize the fetcher to use your loaded Capital.com API secrets
+    # 0. Inject Kaggle Secrets into the environment variables
+    try:
+        from kaggle_secrets import UserSecretsClient
+        user_secrets = UserSecretsClient()
+        os.environ["CAPITAL_API_KEY"] = user_secrets.get_secret("CAPITAL_API_KEY")
+        os.environ["CAPITAL_EMAIL"] = user_secrets.get_secret("CAPITAL_EMAIL")
+        os.environ["CAPITAL_PASSWORD"] = user_secrets.get_secret("CAPITAL_PASSWORD")
+        logger.info("✅ Kaggle Secrets successfully loaded into os.environ")
+    except Exception as e:
+        logger.error(f"🚨 Failed to load Kaggle secrets: {e}. Are they attached to this notebook?")
+        return
+
+    # Initialize the fetcher (it will now successfully find the credentials in os.environ)
     fetcher = CapitalFetcher()
     
-    # 1. Fetch data for MULTIPLE pairs to force the network to learn generalized sentiment
+    # 1. Fetch data for MULTIPLE pairs
     target_pairs = ["EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CHF"]
     data_dict = {}
     
     for pair in target_pairs:
+
         logger.info(f"Fetching max history for {pair}...")
         
         # Fetch the bulk historical data
