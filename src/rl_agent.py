@@ -38,16 +38,23 @@ class RLAgent:
         self.optimizer = optax.adam(learning_rate=3e-4)
         self.params = None
         
-    def train(self, data_dict: dict, total_timesteps: int = 1_000_000, n_envs: int = 4):
-        first_inst = list(data_dict.keys())[0]
-        df = data_dict[first_inst]
+    def train(self, data_dict: dict, total_timesteps: int = 50_000_000, n_envs: int = 4096, batch_size: int = 8192):
+        # 1. Combine all pairs into one massive super-matrix
+        logger.info(f"Aggregating data from {len(data_dict)} currency pairs...")
+        combined_df = pd.concat(list(data_dict.values()), ignore_index=True)
+        data_matrix = jnp.array(combined_df.values, dtype=jnp.float32)
         
-        data_matrix = jnp.array(df.values, dtype=jnp.float32)
         env = JaxForexEnv(data_matrix=data_matrix)
         
+        # 2. Enforce Dual-GPU Usage
         num_devices = jax.local_device_count()
-        logger.info(f"Using {num_devices} JAX devices")
-
+        device_platform = jax.devices()[0].platform.upper()
+        
+        logger.info(f"⚙️ Compute Engine: {num_devices}x {device_platform}")
+        if device_platform != 'GPU':
+            logger.error("🚨 CRITICAL WARNING: JAX IS RUNNING ON CPU!")
+            logger.error("If running on Kaggle, ensure 'T4 x2' is selected and install: !pip install -U \"jax[cuda12]\"")
+            
         rng = jax.random.PRNGKey(42)
         rng, init_rng = jax.random.split(rng)
         
@@ -55,7 +62,6 @@ class RLAgent:
         self.params = self.network.init(init_rng, dummy_obs)
         opt_state = self.optimizer.init(self.params)
         
-        # Updated to jax.tree.map for JAX v0.6.0+
         replicated_params = jax.tree.map(lambda x: jnp.stack([x] * num_devices), self.params)
         replicated_opt_state = jax.tree.map(lambda x: jnp.stack([x] * num_devices), opt_state)
 
@@ -87,9 +93,10 @@ class RLAgent:
             action = jax.random.categorical(rng, logits)
             log_prob = jnp.take_along_axis(jax.nn.log_softmax(logits), action[:, None], axis=-1).squeeze(-1)
             return action, log_prob, val
-
-        batch_size = 2048
-        epochs = total_timesteps // (batch_size * num_devices)
+        
+        # Calculate Epochs based on n_envs and num_devices
+        steps_per_epoch = n_envs
+        epochs = total_timesteps // steps_per_epoch
         
         state_keys = jax.random.split(rng, num_devices)
         
@@ -105,6 +112,12 @@ class RLAgent:
         states = init_envs(state_keys)
         obs = get_obs_pmap(states)
 
+        logger.info(f"🚀 IGNITION: Simulating {total_timesteps:,} steps across {n_envs} Matrix Environments...")
+        
+        import time
+        start_time = time.time()
+        
+        # 3. Main Training Loop with Restored Logging
         for epoch in range(epochs):
             rng, step_rng = jax.random.split(rng)
             step_rngs = jax.random.split(step_rng, num_devices)
@@ -127,16 +140,29 @@ class RLAgent:
             obs = next_obs
             states = next_states
 
-            if epoch % 10 == 0:
-                logger.info(f"Epoch {epoch}/{epochs} | Loss: {jnp.mean(loss):.4f}")
+            # Log metrics every 100 epochs
+            if epoch % 100 == 0 or epoch == epochs - 1:
+                elapsed = time.time() - start_time
+                fps = int((epoch * steps_per_epoch) / elapsed) if elapsed > 0 else 0
+                mean_reward = jnp.mean(rewards)
+                
+                print(f"----------------------------------------")
+                print(f"| time/                   |            |")
+                print(f"|    fps                  | {fps:<10} |")
+                print(f"|    iterations           | {epoch:<10} |")
+                print(f"|    time_elapsed (s)     | {int(elapsed):<10} |")
+                print(f"|    total_timesteps      | {epoch * steps_per_epoch:<10} |")
+                print(f"| train/                  |            |")
+                print(f"|    mean_reward          | {mean_reward:<10.5f} |")
+                print(f"|    loss                 | {jnp.mean(loss):<10.5f} |")
+                print(f"----------------------------------------")
 
-        # Updated to jax.tree.map for JAX v0.6.0+
         self.params = jax.tree.map(lambda x: x[0], replicated_params)
         
         os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
         with open(self.model_path, 'wb') as f:
             pickle.dump(self.params, f)
-        logger.info(f"RL Agent saved to {self.model_path}")
+        logger.info(f"✅ Training Complete. RL Agent saved to {self.model_path}")
 
     def load(self):
         if os.path.exists(self.model_path):

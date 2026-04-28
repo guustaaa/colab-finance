@@ -15,91 +15,32 @@ from src.utils import setup_logger
 
 setup_logger("rl_trainer", "./logs")
 logger = logging.getLogger("rl_trainer")
+# notebooks/train_rl_agent.py
+# ... (Keep your imports and secret loading) ...
 
 def main():
-    print("=" * 60)
-    print("🤖 PHASE 2: DEEP REINFORCEMENT LEARNING (PPO) TRAINER")
-    print("=" * 60)
+    # 1. Fetch data for MULTIPLE pairs to force the network to learn generalized sentiment
+    target_pairs = ["EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CHF"]
+    data_dict = {}
     
-    # ─────────────────────────────────────────────
-    # Load credentials from Colab/Kaggle Secrets
-    # ─────────────────────────────────────────────
-    secret_keys = ["CAPITAL_API_KEY", "CAPITAL_EMAIL", "CAPITAL_PASSWORD"]
-    try:
-        from kaggle_secrets import UserSecretsClient
-        user_secrets = UserSecretsClient()
-        for secret_name in secret_keys:
-            try:
-                val = user_secrets.get_secret(secret_name)
-                if val:
-                    os.environ[secret_name] = val
-                    print(f"✅ Secret loaded: {secret_name}")
-            except Exception:
-                pass
-    except ImportError:
-        pass
-        
-    fetcher = CapitalFetcher(demo=True)
-    scanner = SentimentScanner()
-    articles = scanner.scan_all_feeds()
+    # Assuming your fetcher is initialized here
+    for pair in target_pairs:
+        logger.info(f"Fetching max history for {pair}...")
+        # Replace this with your exact CapitalFetcher call
+        df = fetcher.fetch_bulk_history(pair) 
+        data_dict[pair] = df
+        logger.info(f"✅ {pair} Features Ready: {len(df)} rows.")
 
-    print("\n📥 Fetching feature data for simulation environments...")
-    raw_data = {}
+    logger.info("🧠 Spawning Matrix Environments and Initializing PPO...")
+    agent = RLAgent(model_path="/kaggle/working/ForexAI_State/models/rl_ppo_agent.pkl")
     
-    # We will build a unified environment using the most liquid pair (e.g. EUR_USD) 
-    # to train the base model, or multi-plex it. For this first phase, we will train a massive 
-    # model on EUR_USD features that generalize to other pairs.
-    
-    inst = "EUR_USD"
-    print(f"  Fetching max history for {inst}...")
-    os.makedirs("cache", exist_ok=True)
-    df = fetcher.fetch_bulk_history(
-        inst, years=BULK_HISTORY_YEARS, 
-        granularity=TRADING_GRANULARITY, 
-        cache_path=f"cache/{inst}_h1.parquet"
+    # 2. PUSH THE T4 GPUs TO MAXIMUM CAPACITY
+    agent.train(
+        data_dict=data_dict,
+        total_timesteps=50_000_000,  # 50 Million micro-decisions
+        n_envs=4096,                 # 4,096 Parallel universes simulated at once
+        batch_size=8192              # Massive batches to saturate the 2x T4s
     )
-    
-    if df is None or len(df) < 500:
-        logger.error("Insufficient data to train RL Agent.")
-        return
-
-    print("  Computing technical features and simulating cross-pair state...")
-    # Generate features
-    features_df = compute_all_features(df, sentiment=0.0, cross_pair_data={})
-    
-    if features_df.empty:
-        logger.error("Feature engineering failed.")
-        return
-        
-    print(f"  ✅ Features Ready: {len(features_df)} rows x {len(features_df.columns)} dimensions.")
-    data_dict = {inst: features_df}
-    
-    print("\n🧠 Spawning Matrix Environments and Initializing PPO...")
-    # Kaggle T4x2 usually has 4 CPU cores
-    n_cores = max(1, os.cpu_count() - 1) 
-    
-    # Auto-detect CUDA
-    import torch
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"  ⚙️ Compute Device: {device.upper()}")
-    
-    # Initialize the Agent
-    model_path = os.path.join(DRIVE_MODELS_DIR, "rl_ppo_agent")
-    agent = RLAgent(model_path=model_path, device=device)
-    
-    print(f"\n🚀 BEGINNING DEEP LEARNING ({n_cores} Parallel Environments)")
-    print("  This process will simulate trillions of micro-decisions and optimize for drawdowns.")
-    print("  Check Kaggle console for Stable-Baselines3 progression metrics...")
-    
-    start_time = time.time()
-    
-    # Train for 500,000 steps to start. On Kaggle this should take a few hours.
-    agent.train(data_dict=data_dict, total_timesteps=500_000, n_envs=n_cores)
-    
-    elapsed = time.time() - start_time
-    print(f"\n✅ RL Agent Training Complete! Elapsed time: {elapsed/60:.1f} minutes.")
-    print(f"  The model weights have been saved to: {model_path}.zip")
-    print("  You can now deploy this .zip file to your Linux VPS for live execution.")
 
 if __name__ == "__main__":
     main()
