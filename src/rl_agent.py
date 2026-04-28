@@ -19,7 +19,7 @@ from src.environment import JaxForexEnv
 logger = logging.getLogger("rl_agent")
 
 # =====================================================================
-# 🧠 PST-TRADER WITH MIXED-PRECISION & CONTINUOUS STREAMING
+# 🧠 PST-TRADER WITH MIXED-PRECISION & SEQUENTIAL MINI-BATCHING
 # =====================================================================
 
 class Actor(nn.Module):
@@ -28,7 +28,7 @@ class Actor(nn.Module):
     def __call__(self, x):
         x = nn.LayerNorm()(x)
         
-        # 🔬 RESEARCH FINDING 3: Mixed-Precision Execution (bfloat16)
+        # Mixed-Precision Execution (bfloat16) to save VRAM
         x = jnp.asarray(x, dtype=jnp.bfloat16)
         init_fn = nn.initializers.orthogonal(np.sqrt(2))
         
@@ -81,7 +81,6 @@ class RLAgent:
         self.action_dim = 4
         self.network = HybridNetwork(action_dim=self.action_dim)
         
-        # Math Shield weights
         self.optimizer = optax.chain(
             optax.clip_by_global_norm(0.5),
             optax.adam(learning_rate=3e-4)
@@ -89,8 +88,10 @@ class RLAgent:
         self.params = None
         
     def train(self, data_dict: dict, total_timesteps: int = 500_000_000):
-        N_ENVS = 16384
-        CHUNK_SIZE = 500
+        # 🛠️ Rebalanced for Dual T4 Stability (1 Million steps per rollout)
+        N_ENVS = 8192
+        CHUNK_SIZE = 128
+        NUM_MINIBATCHES = 16 # Splits the chunk into 16 digestible VRAM blocks
         
         logger.info(f"Aggregating data from {len(data_dict)} currency pairs...")
         combined_df = pd.concat(list(data_dict.values()), ignore_index=True)
@@ -101,7 +102,6 @@ class RLAgent:
         logger.info(f"⚙️ Compute Engine: {num_devices}x GPU | Matrix Size: {N_ENVS}x{CHUNK_SIZE}")
         
         rng = jax.random.PRNGKey(42)
-        # 🐛 THE FIX: Correctly split PRNGKeys into an array matching num_devices
         rng, init_rng = jax.random.split(rng)
         step_rngs = jax.random.split(rng, num_devices) 
         
@@ -134,8 +134,7 @@ class RLAgent:
                 
                 next_obs, next_states, rewards, dones, infos = jax.vmap(env.step)(current_states, actions)
                 
-                # 🔬 RESEARCH FINDING 2: Iterable Pipeline / Continuous Stream
-                # Auto-reset environments that hit "done" to a random historical point
+                # Iterable Pipeline / Continuous Stream
                 def single_reset(s, k):
                     rs = jax.random.randint(k, (), minval=env.window_size, maxval=env.max_steps - 1000)
                     return s.replace(
@@ -151,7 +150,6 @@ class RLAgent:
                 reset_keys = jax.random.split(step_rng, dones.shape[0])
                 reset_states_batch = jax.vmap(single_reset)(next_states, reset_keys)
                 
-                # Inject reset states over done states
                 next_states = jax.tree.map(lambda r, n: jnp.where(dones, r, n), reset_states_batch, next_states)
                 next_obs = jax.vmap(env._get_obs)(next_states)
                 
@@ -179,44 +177,52 @@ class RLAgent:
             adv_std = jnp.std(advantages_batch) + 1e-8
             norm_advantages_batch = (advantages_batch - adv_mean) / adv_std
             
-            # 🔬 RESEARCH FINDING 1: Random Reshuffling
-            # Flatten arrays and randomly shuffle indices to stabilize training
-            step_rngs_mapped, shuffle_rng = jax.random.split(step_rngs_mapped)
-            flat_size = CHUNK_SIZE * (N_ENVS // jax.local_device_count())
-            indices = jax.random.permutation(shuffle_rng, flat_size)
-            
-            def flatten_and_shuffle(x):
-                return x.reshape(flat_size, -1).squeeze()[indices]
-            
-            f_obs = flatten_and_shuffle(obs_batch)
-            f_actions = flatten_and_shuffle(actions_batch)
-            f_log_probs = flatten_and_shuffle(log_probs_batch)
-            f_returns = flatten_and_shuffle(returns_batch)
-            f_advs = flatten_and_shuffle(norm_advantages_batch)
-            
-            # PHASE 3: SHUFFLED NETWORK UPDATE
-            def loss_fn(params_to_update):
-                logits, v1, v2 = self.network.apply(params_to_update, f_obs)
-                
-                new_log_probs_full = jax.nn.log_softmax(logits)
-                new_log_probs = jnp.take_along_axis(new_log_probs_full, f_actions[..., None], axis=-1).squeeze(-1)
-                
-                ratio = jnp.exp(new_log_probs - f_log_probs)
-                clip_adv = jnp.clip(ratio, 0.8, 1.2) * f_advs
-                loss_actor = -jnp.mean(jnp.minimum(ratio * f_advs, clip_adv))
-                
-                loss_critic = 0.5 * jnp.mean(huber_loss(v1 - f_returns)) + 0.5 * jnp.mean(huber_loss(v2 - f_returns))
-                entropy = -jnp.mean(jnp.sum(jax.nn.softmax(logits) * new_log_probs_full, axis=-1))
-                
-                return loss_actor + 0.5 * loss_critic - 0.05 * entropy
+            # 🛠️ PHASE 3: SEQUENTIAL MINI-BATCHING (Prevents Compiler Hangs & OOM)
+            def reshape_to_minibatches(x):
+                flat_x = x.reshape(-1, *x.shape[2:])
+                mb_size = flat_x.shape[0] // NUM_MINIBATCHES
+                return flat_x.reshape(NUM_MINIBATCHES, mb_size, *flat_x.shape[1:])
 
-            grad_fn = jax.value_and_grad(loss_fn)
-            loss, grads = grad_fn(params)
-            grads = jax.lax.pmean(grads, axis_name='p')
-            updates, opt_state = self.optimizer.update(grads, opt_state)
-            params = optax.apply_updates(params, updates)
+            mb_obs = reshape_to_minibatches(obs_batch)
+            mb_actions = reshape_to_minibatches(actions_batch)
+            mb_log_probs = reshape_to_minibatches(log_probs_batch)
+            mb_returns = reshape_to_minibatches(returns_batch)
+            mb_advs = reshape_to_minibatches(norm_advantages_batch)
+
+            def update_minibatch(carry, batch_data):
+                p_carry, opt_carry = carry
+                b_obs, b_actions, b_log_probs, b_returns, b_advs = batch_data
+                
+                def loss_fn(params_to_update):
+                    logits, v1, v2 = self.network.apply(params_to_update, b_obs)
+                    new_log_probs_full = jax.nn.log_softmax(logits)
+                    new_log_probs = jnp.take_along_axis(new_log_probs_full, b_actions[..., None], axis=-1).squeeze(-1)
+                    
+                    ratio = jnp.exp(new_log_probs - b_log_probs)
+                    clip_adv = jnp.clip(ratio, 0.8, 1.2) * b_advs
+                    loss_actor = -jnp.mean(jnp.minimum(ratio * b_advs, clip_adv))
+                    
+                    loss_critic = 0.5 * jnp.mean(huber_loss(v1 - b_returns)) + 0.5 * jnp.mean(huber_loss(v2 - b_returns))
+                    entropy = -jnp.mean(jnp.sum(jax.nn.softmax(logits) * new_log_probs_full, axis=-1))
+                    
+                    return loss_actor + 0.5 * loss_critic - 0.05 * entropy
+
+                grad_fn = jax.value_and_grad(loss_fn)
+                loss, grads = grad_fn(p_carry)
+                grads = jax.lax.pmean(grads, axis_name='p')
+                updates, opt_carry = self.optimizer.update(grads, opt_carry)
+                p_carry = optax.apply_updates(p_carry, updates)
+                
+                return (p_carry, opt_carry), loss
+
+            # Sequentially process the 16 minibatches within the compiled graph
+            (params, opt_state), batch_losses = jax.lax.scan(
+                update_minibatch, 
+                (params, opt_state), 
+                (mb_obs, mb_actions, mb_log_probs, mb_returns, mb_advs)
+            )
             
-            return params, opt_state, step_rngs_mapped, states, next_obs, loss, jnp.mean(rewards_batch)
+            return params, opt_state, step_rngs_mapped, states, next_obs, jnp.mean(batch_losses), jnp.mean(rewards_batch)
         
         steps_per_epoch = N_ENVS * CHUNK_SIZE
         state_keys = jax.random.split(rng, num_devices)
@@ -233,12 +239,11 @@ class RLAgent:
         states = init_envs(state_keys)
         obs = get_obs_pmap(states)
 
-        logger.info(f"🚀 OPTIMIZED DECOUPLED PPO ENGINE ONLINE.")
+        logger.info(f"🚀 SEQUENTIAL MINI-BATCH ENGINE ONLINE.")
         start_time = time.time()
         
         epoch = 0
         while True:
-            # Pass step_rngs (which is properly mapped) into process_chunk
             replicated_params, replicated_opt_state, step_rngs, states, obs, loss_mean, reward_mean = process_chunk(
                 replicated_params, replicated_opt_state, step_rngs, states, obs
             )
@@ -290,3 +295,10 @@ class RLAgent:
                 self.params = pickle.load(f)
             return True
         return False
+
+    def predict(self, obs: np.ndarray) -> int:
+        if self.params is None:
+            return 0
+        obs_jnp = jnp.array(obs, dtype=jnp.float32)
+        logits, _, _ = self.network.apply(self.params, obs_jnp)
+        return int(jnp.argmax(logits))
