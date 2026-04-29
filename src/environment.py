@@ -130,25 +130,23 @@ class JaxForexEnv:
         new_max_net_worth = jnp.maximum(state.max_net_worth, new_net_worth)
 
         # -------------------------------------------------------------
-        # 🔬 QUADRATIC PUNISHMENT FOR DRIFTING (As requested)
+        # ⚖️ REBALANCED PENALTIES (Stops NaN Explosions & Encourages Patience)
         # -------------------------------------------------------------
         log_return = jnp.log(new_net_worth / jnp.maximum(state.net_worth, 1.0))
-        
-        # Calculate Drawdown
         drawdown = (new_max_net_worth - new_net_worth) / new_max_net_worth
         
-        # Exponential punishment if the model "gets worse" (drawdown > 1%)
-        # If drawdown is 5%, penalty is (0.05 * 100)^2 = 25.
-        dd_penalty = jnp.where(drawdown > 0.01, (drawdown * 100.0) ** 2, 0.0)
-        
+        # Tangible Transaction Penalty: Subtracts ~0.05% scaled equivalent when trading
         is_transaction = (new_position != state.position)
-        txn_penalty = jnp.where(is_transaction, 0.0005, 0.0) 
+        txn_penalty = jnp.where(is_transaction, 0.5, 0.0) 
         
-        # Final Reward: Log Return scaled up, minus transaction fee, minus massive DD penalty
+        # Soft Linear Drawdown Penalty: Kicks in gracefully after 2% DD instead of squaring it
+        dd_penalty = jnp.where(drawdown > 0.02, drawdown * 50.0, 0.0)
+        
         reward = (log_return * 1000.0) - txn_penalty - dd_penalty
         
+        # Hard cap the ruin penalty so it doesn't break Huber loss
         ruin = new_net_worth <= (self.initial_balance * 0.5)
-        reward = jnp.where(ruin, reward - 1000.0, reward)
+        reward = jnp.where(ruin, reward - 100.0, reward)
         done = jnp.logical_or(done, ruin)
 
         new_state = EnvState(
