@@ -77,9 +77,9 @@ class RLAgent:
         self.params = None
         
     def train(self, data_dict: dict, total_timesteps: int = 500_000_000):
-        N_ENVS = 4096       
-        CHUNK_SIZE = 128    
-        NUM_MINIBATCHES = 16 
+        N_ENVS = 2048   
+        CHUNK_SIZE = 64
+        NUM_MINIBATCHES = 8
         
         logger.info(f"Aggregating Multi-Timeframe matrices...")
         combined_df = pd.concat(list(data_dict.values()), ignore_index=True)
@@ -97,8 +97,32 @@ class RLAgent:
         
         actor_params = self.actor.init(key_a, dummy_obs)
         critic_params = self.critic.init(key_c, dummy_obs, dummy_action)
-        critic_target_params = critic_params # Initialize target identically
-        log_alpha = jnp.array(0.0) # Start with Alpha = 1.0
+        critic_target_params = critic_params 
+        log_alpha = jnp.array(0.0) 
+        
+        opt_state_a = self.opt_actor.init(actor_params)
+        opt_state_c = self.opt_critic.init(critic_params)
+        opt_state_alpha = self.opt_alpha.init(log_alpha)
+        
+        self.params = {'actor': actor_params, 'critic': critic_params, 'target': critic_target_params, 'log_alpha': log_alpha}
+        
+        if self.load():
+            logger.info("Resuming from Custom SAC Checkpoint...")
+            actor_params, critic_params, critic_target_params, log_alpha = self.params['actor'], self.params['critic'], self.params['target'], self.params['log_alpha']
+            
+        # Replicate across devices
+        def rep(x): return jnp.stack([x] * num_devices)
+        p_actor = jax.tree.map(rep, actor_params)
+        p_critic = jax.tree.map(rep, critic_params)
+        p_target = jax.tree.map(rep, critic_target_params)
+        p_alpha = rep(log_alpha)
+        
+        o_actor = jax.tree.map(rep, opt_state_a)
+        o_critic = jax.tree.map(rep, opt_state_c)
+        o_alpha = jax.tree.map(rep, opt_state_alpha)
+        
+        step_rngs_mapped = jax.random.split(rng, num_devices)
+
         
         opt_state_a = self.opt_actor.init(actor_params)
         opt_state_c = self.opt_critic.init(critic_params)
