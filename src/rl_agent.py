@@ -23,35 +23,34 @@ class Actor(nn.Module):
     @nn.compact
     def __call__(self, x):
         x = nn.LayerNorm()(x)
-        x = jnp.asarray(x, dtype=jnp.bfloat16)
+        # Reverted to Float32 to eliminate mathematical NaN explosions
         init_fn = nn.initializers.orthogonal(np.sqrt(2))
         
-        x = nn.Dense(512, dtype=jnp.bfloat16, kernel_init=init_fn)(x)
+        x = nn.Dense(512, kernel_init=init_fn)(x)
         x = nn.tanh(x)
-        x = nn.Dense(512, dtype=jnp.bfloat16, kernel_init=init_fn)(x)
+        x = nn.Dense(512, kernel_init=init_fn)(x)
         x = nn.tanh(x)
         
-        logits = nn.Dense(self.action_dim, dtype=jnp.float32, kernel_init=nn.initializers.orthogonal(0.01))(x)
+        logits = nn.Dense(self.action_dim, kernel_init=nn.initializers.orthogonal(0.01))(x)
         return logits
 
 class TwinCritic(nn.Module):
     @nn.compact
     def __call__(self, x):
         x = nn.LayerNorm()(x)
-        x = jnp.asarray(x, dtype=jnp.bfloat16)
         init_fn = nn.initializers.orthogonal(np.sqrt(2))
         
-        c1 = nn.Dense(512, dtype=jnp.bfloat16, kernel_init=init_fn)(x)
+        c1 = nn.Dense(512, kernel_init=init_fn)(x)
         c1 = nn.relu(c1)
-        c1 = nn.Dense(512, dtype=jnp.bfloat16, kernel_init=init_fn)(c1)
+        c1 = nn.Dense(512, kernel_init=init_fn)(c1)
         c1 = nn.relu(c1)
-        v1 = nn.Dense(1, dtype=jnp.float32, kernel_init=nn.initializers.orthogonal(1.0))(c1)
+        v1 = nn.Dense(1, kernel_init=nn.initializers.orthogonal(1.0))(c1)
         
-        c2 = nn.Dense(512, dtype=jnp.bfloat16, kernel_init=init_fn)(x)
+        c2 = nn.Dense(512, kernel_init=init_fn)(x)
         c2 = nn.relu(c2)
-        c2 = nn.Dense(512, dtype=jnp.bfloat16, kernel_init=init_fn)(c2)
+        c2 = nn.Dense(512, kernel_init=init_fn)(c2)
         c2 = nn.relu(c2)
-        v2 = nn.Dense(1, dtype=jnp.float32, kernel_init=nn.initializers.orthogonal(1.0))(c2)
+        v2 = nn.Dense(1, kernel_init=nn.initializers.orthogonal(1.0))(c2)
         
         return jnp.squeeze(v1, axis=-1), jnp.squeeze(v2, axis=-1)
 
@@ -67,8 +66,8 @@ class HybridNetwork(nn.Module):
         return logits, v1, v2
 
 class RLAgent:
-    # 🎯 TARGETING V9: Clean slate for Log Return Math Optimization
-    def __init__(self, model_path: str = "/kaggle/working/ForexAI_State/models/rl_pst_trader_v9.pkl", device: str = "auto"):
+    # 🎯 TARGETING V10: Guaranteed Stable 32-Bit Execution
+    def __init__(self, model_path: str = "/kaggle/working/ForexAI_State/models/rl_pst_trader_v10.pkl", device: str = "auto"):
         self.model_path = model_path
         self.action_dim = 4
         self.network = HybridNetwork(action_dim=self.action_dim)
@@ -101,7 +100,7 @@ class RLAgent:
         opt_state = self.optimizer.init(self.params)
         
         if self.load():
-            logger.info("Resuming from safe v9 Checkpoint...")
+            logger.info("Resuming from safe v10 Checkpoint...")
             
         replicated_params = jax.tree.map(lambda x: jnp.stack([x] * num_devices), self.params)
         replicated_opt_state = jax.tree.map(lambda x: jnp.stack([x] * num_devices), opt_state)
@@ -205,7 +204,8 @@ class RLAgent:
                     new_log_probs_full = jax.nn.log_softmax(logits)
                     new_log_probs = jnp.take_along_axis(new_log_probs_full, b_actions[..., None], axis=-1).squeeze(-1)
                     
-                    ratio = jnp.exp(new_log_probs - b_log_probs)
+                    # Log Probability Clamp to completely stop exponential gradients
+                    ratio = jnp.exp(jnp.clip(new_log_probs - b_log_probs, -10.0, 10.0))
                     clip_adv = jnp.clip(ratio, 0.8, 1.2) * b_advs
                     loss_actor = -jnp.mean(jnp.minimum(ratio * b_advs, clip_adv))
                     
@@ -245,7 +245,7 @@ class RLAgent:
         states = init_envs(state_keys)
         obs = get_obs_pmap(states)
 
-        logger.info(f"🚀 V9 LOG-RETURN PST-TRADER ONLINE (Zero Hallucination Mode).")
+        logger.info(f"🚀 V10 PST-TRADER SECURED (Float32 Architecture).")
         start_time = time.time()
         
         epoch = 0
@@ -276,7 +276,7 @@ class RLAgent:
                 win_rate = (winning_trades_count / jnp.maximum(1, total_trades_count)) * 100.0
 
                 print(f"----------------------------------------")
-                print(f"| V9 PURE LOG-RETURN PST  |            |")
+                print(f"| V10 SENTIMENT ENGINE    |            |")
                 print(f"|    fps                  | {fps:<10} |")
                 print(f"|    total_timesteps      | {epoch * steps_per_epoch:<10} |")
                 print(f"| accuracy/               |            |")
@@ -292,7 +292,7 @@ class RLAgent:
                 os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
                 with open(self.model_path, 'wb') as f:
                     pickle.dump(self.params, f)
-                logger.info(f"💾 v9 Checkpoint Saved.")
+                logger.info(f"💾 v10 Checkpoint Saved.")
             epoch += 1
 
     def load(self):

@@ -42,13 +42,13 @@ class JaxForexEnv:
         start_idx = state.current_step - self.window_size
         window = jax.lax.dynamic_slice(self.data_matrix, (start_idx, 0), (self.window_size, self.num_features))
         
-        # Independent Column-Wise Z-Score Normalization
         w_mean = jnp.mean(window, axis=0)
         w_std = jnp.std(window, axis=0) + 1e-8
         window_norm = (window - w_mean) / w_std
         window_flat = window_norm.flatten()
 
-        current_mid = self.data_matrix[state.current_step, 3] # 'close' column
+        # Target explicit columns mapped in train_rl_agent.py
+        current_mid = jnp.maximum(self.data_matrix[state.current_step, 3], 1e-5) 
         ask = current_mid + (self.spread / 2.0)
         bid = current_mid - (self.spread / 2.0)
         
@@ -72,7 +72,9 @@ class JaxForexEnv:
         next_step = state.current_step + 1
         done = next_step >= self.max_steps
 
-        current_mid = self.data_matrix[state.current_step, 3]
+        current_mid = jnp.maximum(self.data_matrix[state.current_step, 3], 1e-5)
+        sentiment_score = self.data_matrix[state.current_step, 4]
+        
         ask = current_mid + (self.spread / 2.0)
         bid = current_mid - (self.spread / 2.0)
 
@@ -91,7 +93,7 @@ class JaxForexEnv:
 
             p = 1
             ep = ask
-            u = (b * 0.05) / (current_mid * 0.01) # 5% Position Sizing
+            u = (b * 0.10) / (current_mid * 0.01) # Increased conviction sizing
             return b, p, ep, u, tt, wt
 
         def do_sell(args):
@@ -104,7 +106,7 @@ class JaxForexEnv:
 
             p = -1
             ep = bid
-            u = (b * 0.05) / (current_mid * 0.01)
+            u = (b * 0.10) / (current_mid * 0.01)
             return b, p, ep, u, tt, wt
 
         def do_close(args):
@@ -137,19 +139,32 @@ class JaxForexEnv:
         new_max_net_worth = jnp.maximum(state.max_net_worth, new_net_worth)
 
         # -------------------------------------------------------------
-        # 🔬 THE PURE MATHEMATICAL REWARD (Logarithmic Returns)
+        # 🔬 RESEARCH INTEGRATION: Sentiment Affine Mapping & Volatility Math
         # -------------------------------------------------------------
-        # Log returns symmetrically and beautifully represent portfolio growth
-        log_return = jnp.log(new_net_worth / jnp.maximum(current_net_worth, 1.0))
+        window_closes = jax.lax.dynamic_slice(self.data_matrix, (state.current_step - self.window_size, 3), (self.window_size, 1))
+        volatility = jnp.std(window_closes) / jnp.maximum(jnp.mean(window_closes), 1e-5)
+
+        sentiment_alignment = jnp.where(new_position == 1, sentiment_score,
+                              jnp.where(new_position == -1, -sentiment_score, 0.0))
         
-        # Strict Transaction Penalty: Punish the agent specifically for switching states (overtrading)
+        # Scaling the sentiment reward against localized price volatility
+        scaled_sentiment = (sentiment_alignment * 0.0005) / jnp.maximum(1.0, volatility * 100.0)
+
+        # 🛡️ PURE LOG RETURNS: Guaranteed mathematically bound between safe limits
+        safe_new_nw = jnp.maximum(new_net_worth, 1e-4)
+        safe_old_nw = jnp.maximum(current_net_worth, 1e-4)
+        log_return = jnp.log(safe_new_nw / safe_old_nw)
+        
         is_transaction = (new_position != state.position)
-        txn_penalty = jnp.where(is_transaction, 0.0005, 0.0) # Represents a 0.05% portfolio hit for trading
+        txn_penalty = jnp.where(is_transaction, 0.0002, 0.0) 
         
-        # Scale up for neural network gradient visibility
-        reward = (log_return - txn_penalty) * 1000.0
+        # Composite Reward Structure (Research Point #4)
+        reward = ((log_return + scaled_sentiment) - txn_penalty) * 1000.0
         
-        # Hard Stop: Account Blown
+        # Strict Portfolio Preservation Bounds
+        drawdown = (new_max_net_worth - new_net_worth) / new_max_net_worth
+        reward = jnp.where(drawdown > 0.05, reward - (drawdown * 10.0), reward)
+        
         ruin = new_net_worth <= (self.initial_balance * 0.5)
         reward = jnp.where(ruin, reward - 100.0, reward)
         done = jnp.logical_or(done, ruin)

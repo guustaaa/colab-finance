@@ -2,10 +2,10 @@ import os
 import sys
 import logging
 import warnings
+import numpy as np
 import pandas as pd
 import ta  
 
-# Silence the Pandas/TA FutureWarnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -28,7 +28,21 @@ def add_market_context(df: pd.DataFrame) -> pd.DataFrame:
     df = ta.add_all_ta_features(
         df, open="open", high="high", low="low", close="close", volume="volume", fillna=True
     )
-    df = df.dropna().reset_index(drop=True)
+    
+    # 🔬 Research Point 1: Sentiment Extraction Proxy
+    # Normalizing RSI and MACD to create a [-1, 1] algorithmic sentiment signature
+    rsi_norm = (df['momentum_rsi'] - 50.0) / 50.0
+    macd_norm = (df['trend_macd_diff'] / df['close']) * 1000.0
+    df['synthetic_sentiment'] = (rsi_norm + macd_norm).clip(lower=-1.0, upper=1.0)
+    
+    # Strict Sanitization: Destroy NaNs and Infs before JAX compilation
+    df = df.replace([np.inf, -np.inf], np.nan).dropna().reset_index(drop=True)
+    
+    # 🔒 STRICT COLUMN MAPPING: Guarantee exact indices for JAX
+    core_cols = ['open', 'high', 'low', 'close', 'synthetic_sentiment']
+    other_cols = [c for c in df.columns if c not in core_cols]
+    df = df[core_cols + other_cols]
+    
     return df
 
 def main():
@@ -63,7 +77,7 @@ def main():
         return
 
     logger.info("🧠 Spawning Hybrid PST-Trader Matrix Environments...")
-    agent = RLAgent(model_path="/kaggle/working/ForexAI_State/models/rl_pst_trader_v9.pkl")
+    agent = RLAgent(model_path="/kaggle/working/ForexAI_State/models/rl_pst_trader_v10.pkl")
     agent.train(data_dict=data_dict, total_timesteps=500_000_000)
 
 if __name__ == "__main__":
