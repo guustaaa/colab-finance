@@ -47,8 +47,7 @@ class JaxForexEnv:
         window_norm = (window - w_mean) / w_std
         window_flat = window_norm.flatten()
 
-        # Target explicit columns mapped in train_rl_agent.py
-        current_mid = jnp.maximum(self.data_matrix[state.current_step, 3], 1e-5) 
+        current_mid = self.data_matrix[state.current_step, 3] 
         ask = current_mid + (self.spread / 2.0)
         bid = current_mid - (self.spread / 2.0)
         
@@ -72,16 +71,12 @@ class JaxForexEnv:
         next_step = state.current_step + 1
         done = next_step >= self.max_steps
 
-        current_mid = jnp.maximum(self.data_matrix[state.current_step, 3], 1e-5)
-        sentiment_score = self.data_matrix[state.current_step, 4]
-        
+        current_mid = self.data_matrix[state.current_step, 3]
         ask = current_mid + (self.spread / 2.0)
         bid = current_mid - (self.spread / 2.0)
 
         pnl_long = (bid - state.entry_price) * state.units
         pnl_short = (state.entry_price - ask) * state.units
-        current_unrealized = jnp.where(state.position == 1, pnl_long, jnp.where(state.position == -1, pnl_short, 0.0))
-        current_net_worth = state.balance + current_unrealized
 
         def do_buy(args):
             b, p, ep, u, tt, wt = args
@@ -90,10 +85,9 @@ class JaxForexEnv:
             b = b + realized
             tt = tt + jnp.where(is_rev, 1, 0)
             wt = wt + jnp.where(is_rev & (realized > 0), 1, 0)
-
             p = 1
             ep = ask
-            u = (b * 0.10) / (current_mid * 0.01) # Increased conviction sizing
+            u = (b * 0.10) / (current_mid * 0.01) # 10% sizing
             return b, p, ep, u, tt, wt
 
         def do_sell(args):
@@ -103,7 +97,6 @@ class JaxForexEnv:
             b = b + realized
             tt = tt + jnp.where(is_rev, 1, 0)
             wt = wt + jnp.where(is_rev & (realized > 0), 1, 0)
-
             p = -1
             ep = bid
             u = (b * 0.10) / (current_mid * 0.01)
@@ -114,12 +107,10 @@ class JaxForexEnv:
             is_long = (p == 1)
             is_short = (p == -1)
             realized = jnp.where(is_long, pnl_long, jnp.where(is_short, pnl_short, 0.0))
-            
             b = b + realized
             is_closing = is_long | is_short
             tt = tt + jnp.where(is_closing, 1, 0)
             wt = wt + jnp.where(is_closing & (realized > 0), 1, 0)
-
             p = 0
             ep = 0.0
             u = 0.0
@@ -139,34 +130,25 @@ class JaxForexEnv:
         new_max_net_worth = jnp.maximum(state.max_net_worth, new_net_worth)
 
         # -------------------------------------------------------------
-        # 🔬 RESEARCH INTEGRATION: Sentiment Affine Mapping & Volatility Math
+        # 🔬 QUADRATIC PUNISHMENT FOR DRIFTING (As requested)
         # -------------------------------------------------------------
-        window_closes = jax.lax.dynamic_slice(self.data_matrix, (state.current_step - self.window_size, 3), (self.window_size, 1))
-        volatility = jnp.std(window_closes) / jnp.maximum(jnp.mean(window_closes), 1e-5)
-
-        sentiment_alignment = jnp.where(new_position == 1, sentiment_score,
-                              jnp.where(new_position == -1, -sentiment_score, 0.0))
+        log_return = jnp.log(new_net_worth / jnp.maximum(state.net_worth, 1.0))
         
-        # Scaling the sentiment reward against localized price volatility
-        scaled_sentiment = (sentiment_alignment * 0.0005) / jnp.maximum(1.0, volatility * 100.0)
-
-        # 🛡️ PURE LOG RETURNS: Guaranteed mathematically bound between safe limits
-        safe_new_nw = jnp.maximum(new_net_worth, 1e-4)
-        safe_old_nw = jnp.maximum(current_net_worth, 1e-4)
-        log_return = jnp.log(safe_new_nw / safe_old_nw)
+        # Calculate Drawdown
+        drawdown = (new_max_net_worth - new_net_worth) / new_max_net_worth
+        
+        # Exponential punishment if the model "gets worse" (drawdown > 1%)
+        # If drawdown is 5%, penalty is (0.05 * 100)^2 = 25.
+        dd_penalty = jnp.where(drawdown > 0.01, (drawdown * 100.0) ** 2, 0.0)
         
         is_transaction = (new_position != state.position)
-        txn_penalty = jnp.where(is_transaction, 0.0002, 0.0) 
+        txn_penalty = jnp.where(is_transaction, 0.0005, 0.0) 
         
-        # Composite Reward Structure (Research Point #4)
-        reward = ((log_return + scaled_sentiment) - txn_penalty) * 1000.0
-        
-        # Strict Portfolio Preservation Bounds
-        drawdown = (new_max_net_worth - new_net_worth) / new_max_net_worth
-        reward = jnp.where(drawdown > 0.05, reward - (drawdown * 10.0), reward)
+        # Final Reward: Log Return scaled up, minus transaction fee, minus massive DD penalty
+        reward = (log_return * 1000.0) - txn_penalty - dd_penalty
         
         ruin = new_net_worth <= (self.initial_balance * 0.5)
-        reward = jnp.where(ruin, reward - 100.0, reward)
+        reward = jnp.where(ruin, reward - 1000.0, reward)
         done = jnp.logical_or(done, ruin)
 
         new_state = EnvState(
