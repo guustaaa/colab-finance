@@ -23,18 +23,15 @@ class DiscreteActor(nn.Module):
     
     @nn.compact
     def __call__(self, x, mask):
-        x = nn.LayerNorm()(x)
         x = jnp.asarray(x, dtype=jnp.bfloat16)
         init_fn = nn.initializers.orthogonal(np.sqrt(2))
         
         x = nn.Dense(512, dtype=jnp.bfloat16, kernel_init=init_fn)(x)
-        x = nn.tanh(x)
+        x = nn.relu(x)
         x = nn.Dense(512, dtype=jnp.bfloat16, kernel_init=init_fn)(x)
-        x = nn.tanh(x)
+        x = nn.relu(x)
         
         logits = nn.Dense(self.action_dim, dtype=jnp.float32, kernel_init=nn.initializers.orthogonal(0.01))(x)
-        
-        # 🛡️ Safe Masking: -1e7 is small enough to zero out probabilities without causing NaN underflows
         logits = jnp.where(mask, logits, -1e7)
         return logits
 
@@ -43,7 +40,6 @@ class DiscreteTwinCritic(nn.Module):
     
     @nn.compact
     def __call__(self, x):
-        x = nn.LayerNorm()(x)
         x = jnp.asarray(x, dtype=jnp.bfloat16)
         init_fn = nn.initializers.orthogonal(np.sqrt(2))
         
@@ -61,9 +57,18 @@ class DiscreteTwinCritic(nn.Module):
         
         return q1_out, q2_out
 
+class HybridNetwork(nn.Module):
+    action_dim: int
+    def setup(self):
+        self.actor = DiscreteActor(action_dim=self.action_dim)
+        self.critic = DiscreteTwinCritic(action_dim=self.action_dim)
+
+    def __call__(self, x):
+        pass 
+
 class RLAgent:
-    # TARGETING V2 to drop the NaN-corrupted weights
-    def __init__(self, model_path: str = "/kaggle/working/ForexAI_State/models/rl_discrete_sac_v2.pkl"):
+    # 🎯 TARGETING V4: Clean break to integrate Global Normalization and Rescaled Penalties
+    def __init__(self, model_path: str = "/kaggle/working/ForexAI_State/models/rl_discrete_sac_v4.pkl"):
         self.model_path = model_path
         self.action_dim = 4
         
@@ -72,8 +77,9 @@ class RLAgent:
         
         self.opt_actor = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(learning_rate=3e-4))
         self.opt_critic = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(learning_rate=3e-4))
-        self.opt_alpha = optax.adam(learning_rate=1e-4) # Slower Alpha adaptation
+        self.opt_alpha = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(learning_rate=1e-4)) 
         
+        # Research 4: Entropy Regulation
         self.target_entropy = -0.98 * jnp.log(4.0) 
         self.tau = 0.005 
         self.gamma = 0.99
@@ -90,7 +96,7 @@ class RLAgent:
         
         env = JaxForexEnv(data_matrix=data_matrix)
         num_devices = jax.local_device_count()
-        logger.info(f"⚙️ Discrete SAC Engine: {num_devices}x GPU | Horizon: {N_ENVS}x{CHUNK_SIZE}")
+        logger.info(f"⚙️ Stable Discrete SAC Engine: {num_devices}x GPU | Horizon: {N_ENVS}x{CHUNK_SIZE}")
         
         rng = jax.random.PRNGKey(42)
         rng, key_a, key_c = jax.random.split(rng, 3)
@@ -101,7 +107,7 @@ class RLAgent:
         actor_params = self.actor.init(key_a, dummy_obs, dummy_mask)
         critic_params = self.critic.init(key_c, dummy_obs)
         critic_target_params = critic_params 
-        log_alpha = jnp.array(0.0) 
+        log_alpha = jnp.array(-2.0) 
         
         opt_state_a = self.opt_actor.init(actor_params)
         opt_state_c = self.opt_critic.init(critic_params)
@@ -110,7 +116,7 @@ class RLAgent:
         self.params = {'actor': actor_params, 'critic': critic_params, 'target': critic_target_params, 'log_alpha': log_alpha}
         
         if self.load():
-            logger.info("Resuming from Checkpoint...")
+            logger.info("Resuming from safe v4 Checkpoint...")
             actor_params, critic_params, critic_target_params, log_alpha = self.params['actor'], self.params['critic'], self.params['target'], self.params['log_alpha']
             
         def rep(x): return jnp.stack([x] * num_devices)
@@ -132,8 +138,11 @@ class RLAgent:
             valid_close = position != 0
             return jnp.stack([valid_hold, valid_buy, valid_sell, valid_close], axis=-1)
 
-        # 🛡️ THE FIX: Huber Loss instead of MSE to absorb massive reward shocks safely
-        def huber_loss(x, delta=10.0):
+        # -------------------------------------------------------------
+        # 🔬 RESEARCH 3: HUBER LOSS TUNING
+        # Delta = 5.0 gracefully manages the new target Q bounds
+        # -------------------------------------------------------------
+        def huber_loss(x, delta=5.0):
             return jnp.where(jnp.abs(x) < delta, 0.5 * x**2, delta * (jnp.abs(x) - 0.5 * delta))
 
         @partial(jax.pmap, axis_name='p')
@@ -159,7 +168,10 @@ class RLAgent:
                         max_net_worth=jnp.array(env.initial_balance, dtype=jnp.float32),
                         position=jnp.array(0, dtype=jnp.int32),
                         entry_price=jnp.array(0.0, dtype=jnp.float32),
-                        units=jnp.array(0.0, dtype=jnp.float32)
+                        units=jnp.array(0.0, dtype=jnp.float32),
+                        time_in_trade=jnp.array(0, dtype=jnp.int32),
+                        step_returns_sum=jnp.array(0.0, dtype=jnp.float32),
+                        step_returns_sq_sum=jnp.array(0.0, dtype=jnp.float32)
                     )
                 
                 reset_keys = jax.random.split(step_rng, dones.shape[0])
@@ -195,8 +207,8 @@ class RLAgent:
                 alpha = jnp.exp(ca_alpha)
                 
                 next_logits = self.actor.apply(ca_act, b_nobs, b_nmask)
-                next_probs = jax.nn.softmax(next_logits)
-                next_log_probs = jnp.where(b_nmask, jax.nn.log_softmax(next_logits), 0.0) 
+                next_probs = jnp.where(b_nmask, jax.nn.softmax(next_logits), 0.0)
+                next_log_probs = jnp.where(b_nmask, jax.nn.log_softmax(next_logits), 0.0)
                 
                 next_q1, next_q2 = self.critic.apply(ca_targ, b_nobs)
                 next_q_min = jnp.minimum(next_q1, next_q2)
@@ -208,7 +220,6 @@ class RLAgent:
                     q1, q2 = self.critic.apply(p_c, b_obs)
                     q1_a = jnp.take_along_axis(q1, b_act[..., None], axis=-1).squeeze(-1)
                     q2_a = jnp.take_along_axis(q2, b_act[..., None], axis=-1).squeeze(-1)
-                    # 🛡️ Huber Loss prevents Drawdown/Ruin rewards from shattering the network
                     return 0.5 * jnp.mean(huber_loss(q1_a - q_target)) + 0.5 * jnp.mean(huber_loss(q2_a - q_target))
 
                 c_loss, c_grads = jax.value_and_grad(critic_loss_fn)(ca_crit)
@@ -219,7 +230,7 @@ class RLAgent:
                 def actor_update(ca_act, o_act, ca_alpha, o_al):
                     def actor_loss_fn(p_a):
                         logits = self.actor.apply(p_a, b_obs, b_mask)
-                        probs = jax.nn.softmax(logits)
+                        probs = jnp.where(b_mask, jax.nn.softmax(logits), 0.0)
                         log_probs = jnp.where(b_mask, jax.nn.log_softmax(logits), 0.0)
                         
                         q1, q2 = self.critic.apply(jax.lax.stop_gradient(ca_crit), b_obs)
@@ -241,8 +252,8 @@ class RLAgent:
                     al_grads = jax.lax.pmean(al_grads, axis_name='p')
                     al_updates, o_al = self.opt_alpha.update(al_grads, o_al)
                     
-                    # 🛡️ Bounding Alpha limits Temperature runaways
-                    ca_alpha = jnp.clip(optax.apply_updates(ca_alpha, al_updates), -5.0, 2.0)
+                    # Prevent alpha underflow
+                    ca_alpha = jnp.clip(optax.apply_updates(ca_alpha, al_updates), -5.0, 1.0)
                     
                     ca_targ_new = jax.tree.map(lambda t, c: self.tau * c + (1 - self.tau) * t, ca_targ, ca_crit)
                     return ca_act, o_act, ca_alpha, o_al, ca_targ_new, a_loss
@@ -278,7 +289,7 @@ class RLAgent:
         obs = get_obs_pmap(states)
         global_step = jnp.zeros(num_devices, dtype=jnp.int32)
 
-        logger.info(f"🚀 ROBUST DISCRETE SAC ONLINE (Anti-NaN Enabled).")
+        logger.info(f"🚀 GLOBALLY NORMALIZED SAC v4 ONLINE.")
         start_time = time.time()
         
         epoch = 0
@@ -293,7 +304,6 @@ class RLAgent:
             if current_loss > 10000.0 or jnp.isnan(current_loss):
                 logger.error(f"🚨 Math Integrity Warning ({current_loss}). Rebooting safely...")
                 if self.load():
-                    # Safely extract from dict and broadcast
                     p_actor = jax.tree.map(lambda x: jnp.stack([x] * num_devices), self.params['actor'])
                     p_critic = jax.tree.map(lambda x: jnp.stack([x] * num_devices), self.params['critic'])
                     p_target = jax.tree.map(lambda x: jnp.stack([x] * num_devices), self.params['target'])
@@ -316,7 +326,7 @@ class RLAgent:
                 win_rate = (winning_trades_count / jnp.maximum(1, total_trades_count)) * 100.0
 
                 print(f"----------------------------------------")
-                print(f"| DISCRETE SAC v2         |            |")
+                print(f"| GLOBAL SAC v4           |            |")
                 print(f"|    fps                  | {fps:<10} |")
                 print(f"|    total_timesteps      | {epoch * N_ENVS * CHUNK_SIZE:<10} |")
                 print(f"| accuracy/               |            |")
@@ -337,7 +347,7 @@ class RLAgent:
                 os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
                 with open(self.model_path, 'wb') as f:
                     pickle.dump(self.params, f)
-                logger.info(f"💾 Discrete SAC v2 Checkpoint Saved.")
+                logger.info(f"💾 Discrete SAC v4 Checkpoint Saved.")
             epoch += 1
 
     def load(self):
