@@ -41,20 +41,23 @@ class JaxForexEnv:
     def _get_obs(self, state: EnvState) -> jnp.ndarray:
         start_idx = state.current_step - self.window_size
         window = jax.lax.dynamic_slice(self.data_matrix, (start_idx, 0), (self.window_size, self.num_features))
-        window_flat = window.flatten()
-
-        w_mean = jnp.mean(window_flat)
-        w_std = jnp.std(window_flat) + 1e-8
-        window_flat = (window_flat - w_mean) / w_std
-
-        current_price = self.data_matrix[state.current_step, 3] 
         
-        unrealized_pnl_long = (current_price - state.entry_price) * state.units
-        unrealized_pnl_short = (state.entry_price - current_price) * state.units
+        # Independent Column-Wise Z-Score Normalization
+        w_mean = jnp.mean(window, axis=0)
+        w_std = jnp.std(window, axis=0) + 1e-8
+        window_norm = (window - w_mean) / w_std
+        window_flat = window_norm.flatten()
+
+        current_mid = self.data_matrix[state.current_step, 3] # 'close' column
+        ask = current_mid + (self.spread / 2.0)
+        bid = current_mid - (self.spread / 2.0)
+        
+        pnl_long = (bid - state.entry_price) * state.units
+        pnl_short = (state.entry_price - ask) * state.units
         
         unrealized_pnl = jnp.where(
-            state.position == 1, unrealized_pnl_long,
-            jnp.where(state.position == -1, unrealized_pnl_short, 0.0)
+            state.position == 1, pnl_long,
+            jnp.where(state.position == -1, pnl_short, 0.0)
         )
 
         account_state = jnp.array([
@@ -69,96 +72,87 @@ class JaxForexEnv:
         next_step = state.current_step + 1
         done = next_step >= self.max_steps
 
-        current_price = self.data_matrix[state.current_step, 3]
-        prev_price = self.data_matrix[state.current_step - 1, 3]
+        current_mid = self.data_matrix[state.current_step, 3]
+        ask = current_mid + (self.spread / 2.0)
+        bid = current_mid - (self.spread / 2.0)
 
-        step_pnl_long = (current_price - prev_price) * state.units
-        step_pnl_short = (prev_price - current_price) * state.units
-        step_pnl = jnp.where(state.position == 1, step_pnl_long, jnp.where(state.position == -1, step_pnl_short, 0.0))
-        
-        new_net_worth = state.net_worth + step_pnl
-
-        close_long_pnl = (current_price - state.entry_price) * state.units
-        close_short_pnl = (state.entry_price - current_price) * state.units
+        pnl_long = (bid - state.entry_price) * state.units
+        pnl_short = (state.entry_price - ask) * state.units
+        current_unrealized = jnp.where(state.position == 1, pnl_long, jnp.where(state.position == -1, pnl_short, 0.0))
+        current_net_worth = state.balance + current_unrealized
 
         def do_buy(args):
-            b, p, ep, u, tp, tt, wt, real_pnl = args
-            is_reversal = (p == -1)
-            real_pnl = jnp.where(is_reversal, close_short_pnl, 0.0)
-            b = b + real_pnl
-            tt = tt + jnp.where(is_reversal, 1, 0)
-            wt = wt + jnp.where(is_reversal & (real_pnl > 0), 1, 0)
-            
+            b, p, ep, u, tt, wt = args
+            is_rev = (p == -1)
+            realized = jnp.where(is_rev, pnl_short, 0.0)
+            b = b + realized
+            tt = tt + jnp.where(is_rev, 1, 0)
+            wt = wt + jnp.where(is_rev & (realized > 0), 1, 0)
+
             p = 1
-            ep = current_price + (self.spread / 2)
-            u = (b * 0.05) / (ep * 0.01) # Increased position sizing
-            tp = -(self.spread * u)
-            return b, p, ep, u, tp, tt, wt, real_pnl
+            ep = ask
+            u = (b * 0.05) / (current_mid * 0.01) # 5% Position Sizing
+            return b, p, ep, u, tt, wt
 
         def do_sell(args):
-            b, p, ep, u, tp, tt, wt, real_pnl = args
-            is_reversal = (p == 1)
-            real_pnl = jnp.where(is_reversal, close_long_pnl, 0.0)
-            b = b + real_pnl
-            tt = tt + jnp.where(is_reversal, 1, 0)
-            wt = wt + jnp.where(is_reversal & (real_pnl > 0), 1, 0)
-            
+            b, p, ep, u, tt, wt = args
+            is_rev = (p == 1)
+            realized = jnp.where(is_rev, pnl_long, 0.0)
+            b = b + realized
+            tt = tt + jnp.where(is_rev, 1, 0)
+            wt = wt + jnp.where(is_rev & (realized > 0), 1, 0)
+
             p = -1
-            ep = current_price - (self.spread / 2)
-            u = (b * 0.05) / (ep * 0.01)
-            tp = -(self.spread * u)
-            return b, p, ep, u, tp, tt, wt, real_pnl
+            ep = bid
+            u = (b * 0.05) / (current_mid * 0.01)
+            return b, p, ep, u, tt, wt
 
         def do_close(args):
-            b, p, ep, u, tp, tt, wt, real_pnl = args
-            is_closing_long = (p == 1)
-            is_closing_short = (p == -1)
-            real_pnl = jnp.where(is_closing_long, close_long_pnl, jnp.where(is_closing_short, close_short_pnl, 0.0))
+            b, p, ep, u, tt, wt = args
+            is_long = (p == 1)
+            is_short = (p == -1)
+            realized = jnp.where(is_long, pnl_long, jnp.where(is_short, pnl_short, 0.0))
             
-            b = b + real_pnl
-            is_closing = is_closing_long | is_closing_short
+            b = b + realized
+            is_closing = is_long | is_short
             tt = tt + jnp.where(is_closing, 1, 0)
-            wt = wt + jnp.where(is_closing & (real_pnl > 0), 1, 0)
-            
+            wt = wt + jnp.where(is_closing & (realized > 0), 1, 0)
+
             p = 0
             ep = 0.0
             u = 0.0
-            return b, p, ep, u, tp, tt, wt, real_pnl
+            return b, p, ep, u, tt, wt
 
         def do_hold(args):
             return args
 
-        args = (state.balance, state.position, state.entry_price, state.units, jnp.array(0.0, dtype=jnp.float32), state.total_trades, state.winning_trades, jnp.array(0.0, dtype=jnp.float32))
+        args = (state.balance, state.position, state.entry_price, state.units, state.total_trades, state.winning_trades)
         args = jax.lax.switch(action, [do_hold, do_buy, do_sell, do_close], args)
-        new_balance, new_position, new_entry_price, new_units, trade_penalty, new_total_trades, new_winning_trades, realized_pnl = args
+        new_balance, new_position, new_entry_price, new_units, new_total_trades, new_winning_trades = args
 
+        new_pnl_long = (bid - new_entry_price) * new_units
+        new_pnl_short = (new_entry_price - ask) * new_units
+        new_unrealized = jnp.where(new_position == 1, new_pnl_long, jnp.where(new_position == -1, new_pnl_short, 0.0))
+        new_net_worth = new_balance + new_unrealized
         new_max_net_worth = jnp.maximum(state.max_net_worth, new_net_worth)
 
         # -------------------------------------------------------------
-        # 🛡️ DYNAMIC VOLATILITY & STRICT REWARDS (Research Point #3)
+        # 🔬 THE PURE MATHEMATICAL REWARD (Logarithmic Returns)
         # -------------------------------------------------------------
-        window_closes = jax.lax.dynamic_slice(self.data_matrix, (state.current_step - self.window_size, 3), (self.window_size, 1))
-        volatility = jnp.std(window_closes) / (jnp.mean(window_closes) + 1e-8)
-
-        trade_incentive = jnp.where(
-            realized_pnl > 0, 
-            realized_pnl * 20.0, # Massive multiplier for taking profit
-            jnp.where(realized_pnl < 0, (realized_pnl * 20.0) - (0.01 * self.initial_balance), 0.0) # Flat penalty for losing
-        )
+        # Log returns symmetrically and beautifully represent portfolio growth
+        log_return = jnp.log(new_net_worth / jnp.maximum(current_net_worth, 1.0))
         
-        base_reward = step_pnl + trade_penalty + trade_incentive
+        # Strict Transaction Penalty: Punish the agent specifically for switching states (overtrading)
+        is_transaction = (new_position != state.position)
+        txn_penalty = jnp.where(is_transaction, 0.0005, 0.0) # Represents a 0.05% portfolio hit for trading
         
-        # Scale reward by current market volatility to prevent hyper-active trading during chaos
-        reward = base_reward / (1.0 + (volatility * 100.0))
+        # Scale up for neural network gradient visibility
+        reward = (log_return - txn_penalty) * 1000.0
         
-        drawdown = (new_max_net_worth - new_net_worth) / new_max_net_worth
-        reward = jnp.where(drawdown > 0.10, reward - (drawdown * 20), reward)
-        
+        # Hard Stop: Account Blown
         ruin = new_net_worth <= (self.initial_balance * 0.5)
-        reward = jnp.where(ruin, reward - 1000.0, reward)
+        reward = jnp.where(ruin, reward - 100.0, reward)
         done = jnp.logical_or(done, ruin)
-        
-        reward = reward / self.initial_balance
 
         new_state = EnvState(
             current_step=next_step,
@@ -173,6 +167,6 @@ class JaxForexEnv:
         )
         
         obs = self._get_obs(new_state)
-        info = {"net_worth": new_net_worth, "drawdown": drawdown, "position": new_position}
+        info = {"net_worth": new_net_worth, "position": new_position}
 
         return obs, new_state, reward, done, info

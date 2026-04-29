@@ -67,14 +67,15 @@ class HybridNetwork(nn.Module):
         return logits, v1, v2
 
 class RLAgent:
-    def __init__(self, model_path: str = "/kaggle/working/ForexAI_State/models/rl_pst_trader_v6.pkl", device: str = "auto"):
+    # 🎯 TARGETING V9: Clean slate for Log Return Math Optimization
+    def __init__(self, model_path: str = "/kaggle/working/ForexAI_State/models/rl_pst_trader_v9.pkl", device: str = "auto"):
         self.model_path = model_path
         self.action_dim = 4
         self.network = HybridNetwork(action_dim=self.action_dim)
         
         self.optimizer = optax.chain(
             optax.clip_by_global_norm(0.5),
-            optax.adam(learning_rate=3e-4)
+            optax.adam(learning_rate=3e-4) 
         )
         self.params = None
         
@@ -100,7 +101,7 @@ class RLAgent:
         opt_state = self.optimizer.init(self.params)
         
         if self.load():
-            logger.info("Resuming from safe v6 Checkpoint...")
+            logger.info("Resuming from safe v9 Checkpoint...")
             
         replicated_params = jax.tree.map(lambda x: jnp.stack([x] * num_devices), self.params)
         replicated_opt_state = jax.tree.map(lambda x: jnp.stack([x] * num_devices), opt_state)
@@ -117,18 +118,13 @@ class RLAgent:
                 logits, v1, v2 = self.network.apply(params, current_obs)
                 v_curr = jnp.minimum(v1, v2)
                 
-                # -------------------------------------------------------------
-                # 🛡️ ACTION SPACE MASKING (Research Point #5)
-                # -------------------------------------------------------------
-                # 0: Hold, 1: Buy, 2: Sell, 3: Close
+                # ACTION SPACE MASKING
                 valid_hold = jnp.ones_like(current_states.position, dtype=jnp.bool_)
-                valid_buy = current_states.position <= 0    # Can't buy if already long
-                valid_sell = current_states.position >= 0   # Can't sell if already short
-                valid_close = current_states.position != 0  # Can't close if flat
+                valid_buy = current_states.position <= 0
+                valid_sell = current_states.position >= 0 
+                valid_close = current_states.position != 0 
                 
                 action_mask = jnp.stack([valid_hold, valid_buy, valid_sell, valid_close], axis=-1)
-                
-                # Apply mask: Set invalid actions to negative infinity
                 logits = jnp.where(action_mask, logits, -1e9)
                 
                 actions = jax.random.categorical(step_rng, logits)
@@ -216,7 +212,7 @@ class RLAgent:
                     loss_critic = 0.5 * jnp.mean(huber_loss(v1 - b_returns)) + 0.5 * jnp.mean(huber_loss(v2 - b_returns))
                     entropy = -jnp.mean(jnp.sum(jax.nn.softmax(logits) * new_log_probs_full, axis=-1))
                     
-                    return loss_actor + 0.5 * loss_critic - 0.05 * entropy
+                    return loss_actor + 0.5 * loss_critic - 0.001 * entropy
 
                 grad_fn = jax.value_and_grad(loss_fn)
                 loss, grads = grad_fn(p_carry)
@@ -249,7 +245,7 @@ class RLAgent:
         states = init_envs(state_keys)
         obs = get_obs_pmap(states)
 
-        logger.info(f"🚀 V6 PST-TRADER ONLINE (Action Space Masking Enabled).")
+        logger.info(f"🚀 V9 LOG-RETURN PST-TRADER ONLINE (Zero Hallucination Mode).")
         start_time = time.time()
         
         epoch = 0
@@ -280,7 +276,7 @@ class RLAgent:
                 win_rate = (winning_trades_count / jnp.maximum(1, total_trades_count)) * 100.0
 
                 print(f"----------------------------------------")
-                print(f"| V6 MASKED PST-TRADER    |            |")
+                print(f"| V9 PURE LOG-RETURN PST  |            |")
                 print(f"|    fps                  | {fps:<10} |")
                 print(f"|    total_timesteps      | {epoch * steps_per_epoch:<10} |")
                 print(f"| accuracy/               |            |")
@@ -296,7 +292,7 @@ class RLAgent:
                 os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
                 with open(self.model_path, 'wb') as f:
                     pickle.dump(self.params, f)
-                logger.info(f"💾 v6 Checkpoint Saved.")
+                logger.info(f"💾 v9 Checkpoint Saved.")
             epoch += 1
 
     def load(self):
