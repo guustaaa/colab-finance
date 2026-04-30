@@ -97,7 +97,7 @@ def main():
         return
 
     logger.info("🧠 Spawning CUSTOM SAC Multi-Timeframe Environments...")
-    agent = RLAgent(model_path="/kaggle/working/ForexAI_State/models/rl_discrete_sac_v5.pkl")
+    agent = RLAgent(model_path="/kaggle/working/ForexAI_State/models/rl_discrete_sac_v6.pkl")
     agent.train(data_dict=data_dict, total_timesteps=500_000_000)
 
 if __name__ == "__main__":

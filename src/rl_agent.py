@@ -23,6 +23,7 @@ class DiscreteActor(nn.Module):
     
     @nn.compact
     def __call__(self, x, mask):
+        x = nn.LayerNorm()(x)
         x = jnp.asarray(x, dtype=jnp.bfloat16)
         init_fn = nn.initializers.orthogonal(np.sqrt(2))
         
@@ -40,6 +41,7 @@ class DiscreteTwinCritic(nn.Module):
     
     @nn.compact
     def __call__(self, x):
+        x = nn.LayerNorm()(x)
         x = jnp.asarray(x, dtype=jnp.bfloat16)
         init_fn = nn.initializers.orthogonal(np.sqrt(2))
         
@@ -67,8 +69,8 @@ class HybridNetwork(nn.Module):
         pass 
 
 class RLAgent:
-    # 🎯 TARGETING V4: Clean break to integrate Global Normalization and Rescaled Penalties
-    def __init__(self, model_path: str = "/kaggle/working/ForexAI_State/models/rl_discrete_sac_v5.pkl"):
+    # 🎯 TARGETING V6: Clean start for the 8284-dimension input
+    def __init__(self, model_path: str = "/kaggle/working/ForexAI_State/models/rl_discrete_sac_v6.pkl"):
         self.model_path = model_path
         self.action_dim = 4
         
@@ -79,7 +81,6 @@ class RLAgent:
         self.opt_critic = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(learning_rate=3e-4))
         self.opt_alpha = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(learning_rate=1e-4)) 
         
-        # Research 4: Entropy Regulation
         self.target_entropy = -0.98 * jnp.log(4.0) 
         self.tau = 0.005 
         self.gamma = 0.99
@@ -116,7 +117,7 @@ class RLAgent:
         self.params = {'actor': actor_params, 'critic': critic_params, 'target': critic_target_params, 'log_alpha': log_alpha}
         
         if self.load():
-            logger.info("Resuming from safe v4 Checkpoint...")
+            logger.info("Resuming from safe v6 Checkpoint...")
             actor_params, critic_params, critic_target_params, log_alpha = self.params['actor'], self.params['critic'], self.params['target'], self.params['log_alpha']
             
         def rep(x): return jnp.stack([x] * num_devices)
@@ -138,10 +139,6 @@ class RLAgent:
             valid_close = position != 0
             return jnp.stack([valid_hold, valid_buy, valid_sell, valid_close], axis=-1)
 
-        # -------------------------------------------------------------
-        # 🔬 RESEARCH 3: HUBER LOSS TUNING
-        # Delta = 5.0 gracefully manages the new target Q bounds
-        # -------------------------------------------------------------
         def huber_loss(x, delta=5.0):
             return jnp.where(jnp.abs(x) < delta, 0.5 * x**2, delta * (jnp.abs(x) - 0.5 * delta))
 
@@ -161,6 +158,7 @@ class RLAgent:
                 
                 def single_reset(s, k):
                     rs = jax.random.randint(k, (), minval=env.window_size, maxval=env.max_steps - 1000)
+                    # 🛡️ THE FIX: Removed the ghost step_returns tracking fields
                     return s.replace(
                         current_step=rs,
                         balance=jnp.array(env.initial_balance, dtype=jnp.float32),
@@ -169,9 +167,7 @@ class RLAgent:
                         position=jnp.array(0, dtype=jnp.int32),
                         entry_price=jnp.array(0.0, dtype=jnp.float32),
                         units=jnp.array(0.0, dtype=jnp.float32),
-                        time_in_trade=jnp.array(0, dtype=jnp.int32),
-                        step_returns_sum=jnp.array(0.0, dtype=jnp.float32),
-                        step_returns_sq_sum=jnp.array(0.0, dtype=jnp.float32)
+                        time_in_trade=jnp.array(0, dtype=jnp.int32)
                     )
                 
                 reset_keys = jax.random.split(step_rng, dones.shape[0])
@@ -252,7 +248,6 @@ class RLAgent:
                     al_grads = jax.lax.pmean(al_grads, axis_name='p')
                     al_updates, o_al = self.opt_alpha.update(al_grads, o_al)
                     
-                    # Prevent alpha underflow
                     ca_alpha = jnp.clip(optax.apply_updates(ca_alpha, al_updates), -5.0, 1.0)
                     
                     ca_targ_new = jax.tree.map(lambda t, c: self.tau * c + (1 - self.tau) * t, ca_targ, ca_crit)
@@ -289,7 +284,7 @@ class RLAgent:
         obs = get_obs_pmap(states)
         global_step = jnp.zeros(num_devices, dtype=jnp.int32)
 
-        logger.info(f"🚀 GLOBALLY NORMALIZED SAC v4 ONLINE.")
+        logger.info(f"🚀 GLOBALLY NORMALIZED SAC v6 ONLINE.")
         start_time = time.time()
         
         epoch = 0
@@ -326,7 +321,7 @@ class RLAgent:
                 win_rate = (winning_trades_count / jnp.maximum(1, total_trades_count)) * 100.0
 
                 print(f"----------------------------------------")
-                print(f"| GLOBAL SAC v4           |            |")
+                print(f"| GLOBAL SAC v6           |            |")
                 print(f"|    fps                  | {fps:<10} |")
                 print(f"|    total_timesteps      | {epoch * N_ENVS * CHUNK_SIZE:<10} |")
                 print(f"| accuracy/               |            |")
@@ -347,7 +342,7 @@ class RLAgent:
                 os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
                 with open(self.model_path, 'wb') as f:
                     pickle.dump(self.params, f)
-                logger.info(f"💾 Discrete SAC v4 Checkpoint Saved.")
+                logger.info(f"💾 Discrete SAC v6 Checkpoint Saved.")
             epoch += 1
 
     def load(self):
