@@ -68,7 +68,7 @@ class HybridNetwork(nn.Module):
 
 class RLAgent:
     # 🎯 TARGETING V4: Clean break to integrate Global Normalization and Rescaled Penalties
-    def __init__(self, model_path: str = "/kaggle/working/ForexAI_State/models/rl_discrete_sac_v4.pkl"):
+    def __init__(self, model_path: str = "/kaggle/working/ForexAI_State/models/rl_discrete_sac_v5.pkl"):
         self.model_path = model_path
         self.action_dim = 4
         
